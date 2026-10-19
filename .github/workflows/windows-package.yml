@@ -3,9 +3,15 @@ on:
   push:
     paths:
       - 'Windows/**'
+      - 'VERSION'
       - 'Resources/**'
       - '.github/workflows/windows-package.yml'
   workflow_dispatch:
+    inputs:
+      version:
+        description: 'Optional package version (defaults to VERSION)'
+        required: false
+        type: string
 permissions:
   contents: read
 jobs:
@@ -18,7 +24,13 @@ jobs:
         with:
           dotnet-version: '8.0.x'
       - name: Publish standalone Windows app
-        run: dotnet publish Windows/HandTodo.Windows.csproj -c Release -r win-x64 --self-contained true -o package
+        shell: pwsh
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
+        run: |
+          $version = if ($env:REQUESTED_VERSION) { $env:REQUESTED_VERSION } else { (Get-Content VERSION -Raw).Trim() }
+          if ($version -notmatch '^\d+\.\d+\.\d+$') { throw 'Invalid version' }
+          dotnet publish Windows/HandTodo.Windows.csproj -c Release -r win-x64 --self-contained true -p:Version=$version -o package
       - name: Test native startup and core behavior
         shell: pwsh
         run: |

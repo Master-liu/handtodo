@@ -1,4 +1,4 @@
-掌上待办 0.2.0 · Windows x64 原生试用版
+掌上待办 {{VERSION}} · Windows x64 原生试用版
 
 系统：Windows 10 / Windows 11，64 位。
 使用：先解压整个 ZIP，再双击 HandTodo.exe。程序已包含所需运行时，无需另行安装 .NET。

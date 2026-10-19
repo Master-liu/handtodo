@@ -6,3 +6,5 @@
 /Windows/bin/
 /Windows/obj/
 /Distribution/output/
+__pycache__/
+*.py[cod]

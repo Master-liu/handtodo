@@ -1,0 +1,6 @@
+interface:
+  display_name: "HandTodo 打包"
+  short_description: "按固定流程生成掌上待办的 Mac 与 Windows 包，附验证记录和校验码"
+  default_prompt: "使用 $handtodo-package 按项目流程打包 HandTodo，并交付经过验证的分发包。"
+policy:
+  allow_implicit_invocation: true

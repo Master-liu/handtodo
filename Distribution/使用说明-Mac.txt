@@ -1,4 +1,4 @@
-掌上待办 0.2.0 · macOS 通用版
+掌上待办 {{VERSION}} · macOS 通用版
 
 系统：macOS 13 或更新版本，支持 Apple 芯片与 Intel。
 安装：打开 DMG，将「掌上待办」拖到 Applications 文件夹，再从 Applications 打开。

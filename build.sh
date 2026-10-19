@@ -2,6 +2,7 @@
 set -euo pipefail
 cd "${0:A:h}"
 APP="$PWD/build/掌上待办.app"
+VERSION="${HANDTODO_VERSION:-$(cat VERSION)}"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 SDK=$(xcrun --sdk macosx --show-sdk-path)
 mkdir -p build/objects
@@ -26,5 +27,13 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 <key>NSHighResolutionCapable</key><true/>
 </dict></plist>
 PLIST
+python3 - "$APP/Contents/Info.plist" "$VERSION" <<'PYVERSION'
+import plistlib,sys
+path=sys.argv[1]
+with open(path,'rb') as source: data=plistlib.load(source)
+data['CFBundleShortVersionString']=sys.argv[2]
+data['CFBundleVersion']=sys.argv[2]
+with open(path,'wb') as output: plistlib.dump(data,output)
+PYVERSION
 codesign --force --sign - "$APP"
 echo "$APP"

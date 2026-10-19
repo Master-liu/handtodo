@@ -85,3 +85,11 @@
 Windows 为原生 WPF/.NET 8 适配版，源代码在 `Windows/`；构建需要 .NET 8 SDK，macOS 可交叉编译。GitHub Actions 会在 Windows 上构建、运行原生启动与核心功能检查，并保留测试截图和独立程序产物。两个平台分别在本机存储内容，不自动同步。
 
 当前为未签名的朋友试用版，未提供 Apple 公证和 Windows 代码签名；系统首次运行可能显示来源提示。安装包不包含开发机上的个人待办、涂画或恢复备份。分发产物位于 `Distribution/output/`，不提交到 Git。
+
+## 统一打包工具
+
+以后打包统一使用 `./package.sh`：默认双平台，也可 `./package.sh macos` 或 `./package.sh windows`。默认版本从 `VERSION` 读取；追加 `--version x.y.z` 可指定本次版本。`--check` 检查环境，`--dry-run` 查看计划。
+
+每次任务在 `Distribution/output/<版本>/<时间>-<提交>/` 生成独立产物、验证记录、日志与 SHA256，失败不会覆盖旧包或更新 latest 指针。Windows 原生验证默认自动执行；未经验证不会标成通过。详细流程见 [Distribution/打包流程.md](Distribution/打包流程.md)。
+
+项目附有 `.agents/skills/handtodo-package/SKILL.md` 与 `AGENTS.md`；本机也已安装 `handtodo-package` Skill，后续说“打包”即可按该流程选路执行。
