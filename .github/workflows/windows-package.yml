@@ -1,0 +1,39 @@
+name: Windows package and native smoke test
+on:
+  push:
+    paths:
+      - 'Windows/**'
+      - 'Resources/**'
+      - '.github/workflows/windows-package.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - name: Publish standalone Windows app
+        run: dotnet publish Windows/HandTodo.Windows.csproj -c Release -r win-x64 --self-contained true -o package
+      - name: Test native startup and core behavior
+        shell: pwsh
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP 'handtodo-tests'
+          $process = Start-Process -FilePath '.\package\HandTodo.exe' -ArgumentList @('--self-test', $out) -PassThru
+          if (-not $process.WaitForExit(120000)) { $process.Kill(); throw 'Native app test timed out' }
+          Get-Content (Join-Path $out 'result.txt')
+          if ($process.ExitCode -ne 0) { throw "Native app test failed: $($process.ExitCode)" }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-native-test-report
+          path: '${{ runner.temp }}/handtodo-tests'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: HandTodo-Windows-x64
+          path: package/HandTodo.exe
+          compression-level: 0

@@ -3,3 +3,6 @@
 /.swiftpm/
 .DS_Store
 *.xcuserstate
+/Windows/bin/
+/Windows/obj/
+/Distribution/output/

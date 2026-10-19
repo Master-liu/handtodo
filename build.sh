@@ -3,7 +3,12 @@ set -euo pipefail
 cd "${0:A:h}"
 APP="$PWD/build/掌上待办.app"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-swiftc Sources/*.swift -o "$APP/Contents/MacOS/HandTodo" -framework AppKit -O
+SDK=$(xcrun --sdk macosx --show-sdk-path)
+mkdir -p build/objects
+for ARCH in arm64 x86_64; do
+  swiftc Sources/*.swift -target "$ARCH-apple-macosx13.0" -sdk "$SDK" -o "build/objects/HandTodo-$ARCH" -framework AppKit -O
+done
+lipo -create build/objects/HandTodo-arm64 build/objects/HandTodo-x86_64 -output "$APP/Contents/MacOS/HandTodo"
 cp Resources/hand.png Resources/hand-height.png "$APP/Contents/Resources/"
 mkdir -p "$APP/Contents/Resources/Doodles"
 cp Resources/Doodles/*.png "$APP/Contents/Resources/Doodles/"
@@ -15,7 +20,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 <key>CFBundleIdentifier</key><string>local.achoo.handtodo</string>
 <key>CFBundleName</key><string>掌上待办</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleShortVersionString</key><string>0.1.0</string>
+<key>CFBundleShortVersionString</key><string>0.2.0</string>
 <key>LSMinimumSystemVersion</key><string>13.0</string>
 <key>LSUIElement</key><true/>
 <key>NSHighResolutionCapable</key><true/>

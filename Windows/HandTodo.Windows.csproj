@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType><TargetFramework>net8.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF><UseWindowsForms>true</UseWindowsForms><EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <ImplicitUsings>disable</ImplicitUsings><Nullable>enable</Nullable>
+    <AssemblyName>HandTodo</AssemblyName><Version>0.2.0</Version>
+    <PublishSingleFile>true</PublishSingleFile><SelfContained>true</SelfContained><IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile><DebugType>none</DebugType><PublishTrimmed>false</PublishTrimmed>
+  </PropertyGroup>
+  <ItemGroup>
+    <EmbeddedResource Include="../Resources/hand.png" LogicalName="hand.png" />
+    <EmbeddedResource Include="../Resources/hand-height.png" LogicalName="hand-height.png" />
+    <EmbeddedResource Include="../Resources/Doodles/*.png" LogicalName="%(Filename)%(Extension)" />
+  </ItemGroup>
+</Project>
