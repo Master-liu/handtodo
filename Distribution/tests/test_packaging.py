@@ -12,6 +12,16 @@ pkg = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(pkg)
 
 class PackagingTests(unittest.TestCase):
+    def test_unrelated_documents_do_not_mark_build_sources_dirty(self):
+        def git(*args, **kwargs):
+            if args[0] == "status":
+                return "" if "--" in args else "?? personal-notes/"
+            return "main" if args[0:2] == ("rev-parse", "--abbrev-ref") else "abc"
+        with patch.object(pkg, "git", git):
+            source = pkg.source_info()
+            self.assertFalse(source["dirty"])
+            self.assertTrue(source["other_changes_present"])
+
     def test_bad_version_rejected_before_running_tools(self):
         for version in ["../escape", "0.2", "0.2.0;bad", "0.2.0\n"]:
             with self.assertRaises(pkg.PackageError):

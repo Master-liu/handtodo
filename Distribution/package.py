@@ -85,9 +85,13 @@ def release_lock():
                 fcntl.flock(f.fileno(), fcntl.LOCK_UN)
 
 def source_info():
+    # Unrelated notes/documents must not prevent testing the exact application sources.
+    paths = ["Sources", "Windows", "Resources", "Distribution", ".github", "VERSION", "build.sh", "package.sh"]
+    scoped = git("status", "--porcelain", "--untracked-files=normal", "--", *paths, required=False)
+    all_changes = git("status", "--porcelain", "--untracked-files=normal", required=False)
     return {"commit": git("rev-parse", "HEAD", required=False) or None,
             "branch": git("rev-parse", "--abbrev-ref", "HEAD", required=False) or None,
-            "dirty": bool(git("status", "--porcelain", "--untracked-files=normal", required=False))}
+            "dirty": bool(scoped), "other_changes_present": all_changes != scoped}
 
 def repository():
     remote = git("remote", "get-url", "origin")
@@ -169,7 +173,7 @@ def check_windows_report(payload, destination):
 
 def verify_windows_github(source, version, output, wait_seconds):
     if not source["commit"] or source["dirty"]:
-        raise PackageError("Windows 云端验证要求干净且已同步的提交；先保存并同步源码，打包工具不会自动提交或推送")
+        raise PackageError("Windows 云端验证要求构建相关文件干净且提交已同步；先保存并同步源码，打包工具不会自动提交或推送")
     repo = repository()
     api = GitHub(repo)
     commit = source["commit"]
@@ -362,6 +366,9 @@ class Pipeline:
         self.manifest["status"] = "building"
         self.write_manifest()
         try:
+            cloud = self.args.windows_test == "github" or (self.args.windows_test == "auto" and os.name != "nt")
+            if "windows" in self.platforms and cloud and self.source["dirty"]:
+                raise PackageError("构建相关文件尚未提交，无法进行同一源码的 Windows 云端验证；未启动构建")
             for target in self.platforms:
                 getattr(self, target)()
                 self.write_manifest()

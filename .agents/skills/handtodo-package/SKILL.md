@@ -22,7 +22,7 @@ description: 为 HandTodo（掌上待办）执行可复用的 Mac、Windows 或�
 ## 执行与验证
 
 1. 运行所选命令，等待本次任务结束；不要因为脚本暂时无输出就启动第二个打包任务。
-2. Windows 默认验证策略：Windows 本机原生检查；Mac 交叉构建后读取或触发 GitHub Actions 对同一提交的原生检查。只有 `manifest.json` 写明 `passed` 才报告已验证。云端验证需干净且已同步的提交。
+2. Windows 默认验证策略：Windows 本机原生检查；Mac 交叉构建后读取或触发 GitHub Actions 对同一提交的原生检查。只有 `manifest.json` 写明 `passed` 才报告已验证。云端验证需构建相关文件干净且已同步的提交。
 3. 云端验证不能成立时，说明具体原因。只有用户明确接受未验证包时才用 `--windows-test skip`，并在交付中明确说明；不得把交叉编译成功说成 Windows 已运行通过。
 4. 读取脚本返回的本次输出目录、`manifest.json`、`SHA256SUMS.txt`；确认请求的平台都在其中。失败任务不更新 `latest.json`，因此失败时不能拿旧 latest 当本次成果。
 5. 交付本次文件的绝对路径链接，简述适用平台、安装方式和真实签名状态。安装包不包含个人待办或涂画。
