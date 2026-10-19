@@ -148,6 +148,7 @@ public sealed class HandWindow:Window {
   state.Stickers.Add(new Sticker{Asset="02-rocket",X=280,Y=280});tool=Tool.Sticker;selected=0;TransformSticker(1.5,Math.PI/4);Check(Math.Abs(state.Stickers[0].Scale-1.5)<0.001&&Math.Abs(state.Stickers[0].Rotation-Math.PI/4)<0.001,"Sticker scale and angle must work");
   Save();var restored=Decode(File.ReadAllBytes(DataFile));Check(restored.Notes.Count==1&&restored.Strokes.Count==1&&restored.Stickers.Count==1,"Independent layers must survive saving");
   Refresh();var rendered=Pixels((BitmapSource)inkImage.Source);Check(rendered.Any(v=>v>0),"Ink must be visible");for(int i=0;i<W*H;i++)if(skin[i]<240)Check(rendered[i*4+3]==0,"Ink must remain inside skin");
+  canvas.UpdateLayout();Dispatcher.Invoke(()=>{},DispatcherPriority.ApplicationIdle);
   var screenshot=new RenderTargetBitmap(W,H,96,96,PixelFormats.Pbgra32);screenshot.Render(canvas);var encoder=new PngBitmapEncoder();encoder.Frames.Add(BitmapFrame.Create(screenshot));using(var file=File.Create(Path.Combine(output,"windows-preview.png")))encoder.Save(file);
   Wash();Check(state.Empty&&Pixels((BitmapSource)inkImage.Source).All(v=>v==0),"Wash must remove every pixel of every content layer");Check(Decode(File.ReadAllBytes(DataFile)).Empty,"Clean hand must persist");Undo();Check(state.Notes.Count==1&&state.Strokes.Count==1&&state.Stickers.Count==1,"Undo wash must restore all layer types");
  }
