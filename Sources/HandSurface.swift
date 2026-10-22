@@ -8,6 +8,7 @@ final class HandSurface {
     let heights: [Double]
     let sourceX: [Double]
     let sourceY: [Double]
+    let inverseDisplacement: NSRect
     init(url: URL) {
         let map = NSBitmapImageRep(data: try! Data(contentsOf: url))!
         precondition(map.pixelsWide == Self.width && map.pixelsHigh == Self.height)
@@ -29,6 +30,9 @@ final class HandSurface {
             xs.append(p.x); ys.append(p.y)
         } }
         sourceX = xs; sourceY = ys
+        let dx = xs.enumerated().map { $0.element-Double($0.offset % Self.width) }
+        let dy = ys.enumerated().map { $0.element-Double($0.offset / Self.width) }
+        inverseDisplacement = NSRect(x:dx.min()!-1,y:dy.min()!-1,width:dx.max()!-dx.min()!+2,height:dy.max()!-dy.min()!+2)
     }
     private static func height(_ p: NSPoint, _ values: [Double]) -> Double {
         let px = min(639.0, max(0, p.x)), py = min(426.0, max(0, p.y))
@@ -68,11 +72,70 @@ final class HandSurface {
         } }
         return result
     }
+    static func inkBounds(_ bitmap: NSBitmapImageRep) -> NSRect {
+        let pixels = bitmap.bitmapData!, scale = Double(bitmap.pixelsWide)/Double(Self.width)
+        var left = bitmap.pixelsWide, top = bitmap.pixelsHigh, right = -1, bottom = -1
+        for y in 0..<bitmap.pixelsHigh {
+            let row = y*bitmap.bytesPerRow
+            for x in 0..<bitmap.pixelsWide where pixels[row+x*4+3] != 0 {
+                left = min(left,x); right = max(right,x); top = min(top,y); bottom = max(bottom,y)
+            }
+        }
+        guard right >= left else { return .zero }
+        return NSRect(x:Double(left)/scale,y:Double(top)/scale,width:Double(right-left+1)/scale,height:Double(bottom-top+1)/scale)
+    }
+    func displayBounds(_ source: NSRect, anchor: NSPoint, angle: Double, scale: Int) -> NSRect {
+        guard !source.isEmpty else { return .zero }
+        let padded = source.insetBy(dx:-1/Double(scale),dy:-1/Double(scale))
+        let corners = [NSPoint(x:padded.minX,y:padded.minY),NSPoint(x:padded.maxX,y:padded.minY),NSPoint(x:padded.minX,y:padded.maxY),NSPoint(x:padded.maxX,y:padded.maxY)].map { orient($0,anchor:anchor,angle:angle) }
+        let left = corners.map(\.x).min()!-inverseDisplacement.maxX
+        let top = corners.map(\.y).min()!-inverseDisplacement.maxY
+        let right = corners.map(\.x).max()!-inverseDisplacement.minX
+        let bottom = corners.map(\.y).max()!-inverseDisplacement.minY
+        return NSRect(x:floor(left*Double(scale)),y:floor(top*Double(scale)),width:ceil(right*Double(scale))-floor(left*Double(scale)),height:ceil(bottom*Double(scale))-floor(top*Double(scale))).intersection(NSRect(x:0,y:0,width:Self.width*scale,height:Self.height*scale))
+    }
+    // Sample the original artwork once, combining optional rotation and surface deformation.
+    // Bitmap dimensions follow the display scale; all geometry remains in hand points.
+    func warpDetailed(_ bitmap: NSBitmapImageRep, anchor: NSPoint = .zero, angle: Double = 0, sourceBounds: NSRect? = nil, clipped: Bool = true) -> NSBitmapImageRep {
+        let scale = bitmap.pixelsWide / Self.width
+        precondition(scale >= 1 && bitmap.pixelsHigh == Self.height * scale)
+        let result = HandView.blank(scale: scale)
+        let input = bitmap.bitmapData!, output = result.bitmapData!
+        let c = cos(angle), s = sin(angle)
+        let region = clipped ? displayBounds(sourceBounds ?? Self.inkBounds(bitmap),anchor:anchor,angle:angle,scale:scale) : NSRect(x:0,y:0,width:result.pixelsWide,height:result.pixelsHigh)
+        guard !region.isEmpty else { return result }
+        for y in Int(region.minY)..<Int(region.maxY) { for x in Int(region.minX)..<Int(region.maxX) {
+            let px = Double(x)/Double(scale), py = Double(y)/Double(scale)
+            let mx = Int(px), my = Int(py)
+            guard skin[my*Self.width+mx] else { continue }
+            let fx = px-Double(mx), fy = py-Double(my)
+            func mapped(_ values: [Double]) -> Double {
+                let i = my*Self.width+mx, right = min(mx+1,Self.width-1)-mx
+                let below = (min(my+1,Self.height-1)-my)*Self.width
+                return values[i]*(1-fx)*(1-fy)+values[i+right]*fx*(1-fy)
+                    + values[i+below]*(1-fx)*fy+values[i+below+right]*fx*fy
+            }
+            let dx = mapped(sourceX)-anchor.x, dy = mapped(sourceY)-anchor.y
+            let sx = (anchor.x+dx*c+dy*s)*Double(scale)
+            let sy = (anchor.y-dx*s+dy*c)*Double(scale)
+            guard sx >= 0, sx < Double(bitmap.pixelsWide-1), sy >= 0, sy < Double(bitmap.pixelsHigh-1) else { continue }
+            let ix = Int(sx), iy = Int(sy), tx = sx-Double(ix), ty = sy-Double(iy)
+            let offset = iy*bitmap.bytesPerRow+ix*4, dest = y*result.bytesPerRow+x*4
+            for channel in 0..<4 {
+                let value = Double(input[offset+channel])*(1-tx)*(1-ty)
+                    + Double(input[offset+4+channel])*tx*(1-ty)
+                    + Double(input[offset+bitmap.bytesPerRow+channel])*(1-tx)*ty
+                    + Double(input[offset+bitmap.bytesPerRow+4+channel])*tx*ty
+                output[dest+channel] = UInt8(min(255,max(0,value.rounded())))
+            }
+        } }
+        return result
+    }
+
 }
 
 final class SurfaceTextView: NSTextView {
     var surface: HandSurface?
-    private var rasterizing = false
     private var caretVisible = true
     var anchor: NSPoint { NSPoint(x: frame.minX+textContainerOrigin.x, y: frame.minY+textContainerOrigin.y) }
     var angle: Double { surface?.writingAngle(at: anchor) ?? 0 }
@@ -89,24 +152,50 @@ final class SurfaceTextView: NSTextView {
     override func draw(_ dirtyRect: NSRect) { }
     func drawOnHand() {
         guard let surface else { return }
-        let bitmap = HandView.blank()
+        let scale = max(1, Int(ceil(window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2)))
+        let bitmap = textBitmap(scale: scale)
+        let image = NSImage(size: NSSize(width: 640, height: 427))
+        image.addRepresentation(surface.warpDetailed(bitmap, anchor: anchor, angle: angle))
+        image.draw(in: NSRect(x: 0, y: 0, width: 640, height: 427), from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: true, hints: nil)
+    }
+    func textBitmap(scale: Int, editing: Bool = true) -> NSBitmapImageRep {
+        let bitmap = HandView.blank(scale: scale)
         NSGraphicsContext.saveGraphicsState()
         let ctx = NSGraphicsContext(bitmapImageRep: bitmap)!
         ctx.cgContext.translateBy(x: 0, y: 427); ctx.cgContext.scaleBy(x: 1, y: -1)
+        ctx.cgContext.setShouldAntialias(true)
+        ctx.cgContext.setShouldSmoothFonts(false)
         NSGraphicsContext.current = NSGraphicsContext(cgContext: ctx.cgContext, flipped: true)
-        guard let manager = layoutManager, let container = textContainer else { NSGraphicsContext.restoreGraphicsState(); return }
+        guard let manager = layoutManager, let container = textContainer else { NSGraphicsContext.restoreGraphicsState(); return bitmap }
         manager.ensureLayout(for: container)
         let origin = anchor, range = manager.glyphRange(for: container)
-        manager.drawBackground(forGlyphRange: range, at: origin)
+        if editing { manager.drawBackground(forGlyphRange: range, at: origin) }
         manager.drawGlyphs(forGlyphRange: range, at: origin)
-        if caretVisible && selectedRange().length == 0 {
+        if editing && caretVisible && selectedRange().length == 0 {
             var caret = caretRect()
             caret.origin.x += origin.x; caret.origin.y += origin.y
             insertionPointColor.setFill(); caret.fill()
         }
         NSGraphicsContext.restoreGraphicsState()
-        let image = NSImage(size: NSSize(width: 640, height: 427)); image.addRepresentation(surface.warp(surface.oriented(bitmap, anchor: anchor, angle: angle)))
-        image.draw(in: NSRect(x: 0, y: 0, width: 640, height: 427), from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: true, hints: nil)
+        return bitmap
+    }
+    // A local, pixel-aligned source retains lines outside the fixed hand canvas.
+    var contentOrigin: NSPoint { NSPoint(x: floor(anchor.x)-2, y: floor(anchor.y)-2) }
+    func contentBitmap(scale: Int) -> NSBitmapImageRep {
+        guard let manager = layoutManager, let container = textContainer else { return HandView.blank(scale: scale) }
+        manager.ensureLayout(for: container)
+        let used = manager.usedRect(for: container)
+        let origin = NSPoint(x: anchor.x-contentOrigin.x, y: anchor.y-contentOrigin.y)
+        let size = NSSize(width: ceil(max(container.containerSize.width, used.maxX)+origin.x+2), height: ceil(used.maxY+origin.y+2))
+        let bitmap = HandView.blank(size: size, scale: scale)
+        NSGraphicsContext.saveGraphicsState()
+        let ctx = NSGraphicsContext(bitmapImageRep: bitmap)!
+        ctx.cgContext.translateBy(x: 0, y: size.height); ctx.cgContext.scaleBy(x: 1, y: -1)
+        ctx.cgContext.setShouldAntialias(true); ctx.cgContext.setShouldSmoothFonts(false)
+        NSGraphicsContext.current = NSGraphicsContext(cgContext: ctx.cgContext, flipped: true)
+        manager.drawGlyphs(forGlyphRange: manager.glyphRange(for: container), at: origin)
+        NSGraphicsContext.restoreGraphicsState()
+        return bitmap
     }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
     func caretRect() -> NSRect {
@@ -140,7 +229,7 @@ final class SurfaceTextView: NSTextView {
         return used.offsetBy(dx:anchor.x,dy:anchor.y).insetBy(dx:-5,dy:-4).contains(canonical)
     }
     override func drawInsertionPoint(in rect: NSRect, color: NSColor, turnedOn flag: Bool) {
-        guard surface != nil, !rasterizing else { super.drawInsertionPoint(in: rect, color: color, turnedOn: flag); return }
+        guard surface != nil else { super.drawInsertionPoint(in: rect, color: color, turnedOn: flag); return }
         caretVisible = flag; refreshSurface()
     }
 }

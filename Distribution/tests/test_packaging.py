@@ -12,6 +12,23 @@ pkg = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(pkg)
 
 class PackagingTests(unittest.TestCase):
+    def test_finder_metadata_does_not_change_source_fingerprint(self):
+        with tempfile.TemporaryDirectory() as d, patch.object(pkg, "ROOT", Path(d)):
+            root = Path(d)
+            resources = root / "Resources"
+            (resources / "Brand").mkdir(parents=True)
+            asset = resources / "hand.png"
+            asset.write_bytes(b"original asset")
+            original = pkg.source_fingerprint()
+            (resources / ".DS_Store").write_bytes(b"Finder state")
+            nested = resources / "Brand/.DS_Store"
+            nested.write_bytes(b"folder layout")
+            self.assertEqual(pkg.source_fingerprint(), original)
+            nested.write_bytes(b"updated folder layout")
+            self.assertEqual(pkg.source_fingerprint(), original)
+            asset.write_bytes(b"changed asset")
+            self.assertNotEqual(pkg.source_fingerprint(), original)
+
     def test_unrelated_documents_do_not_mark_build_sources_dirty(self):
         def git(*args, **kwargs):
             if args[0] == "status":

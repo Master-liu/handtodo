@@ -1,0 +1,77 @@
+{
+  "passed": true,
+  "master": {
+    "file": "HandTodo-1024.png",
+    "dimensions": [
+      1024,
+      1024
+    ],
+    "alpha_channel": true
+  },
+  "macos": {
+    "icns_roundtrip_passed": true,
+    "representations": [
+      {
+        "file": "HandTodo.iconset/icon_16x16.png",
+        "pixels": 16
+      },
+      {
+        "file": "HandTodo.iconset/icon_16x16@2x.png",
+        "pixels": 32
+      },
+      {
+        "file": "HandTodo.iconset/icon_32x32.png",
+        "pixels": 32
+      },
+      {
+        "file": "HandTodo.iconset/icon_32x32@2x.png",
+        "pixels": 64
+      },
+      {
+        "file": "HandTodo.iconset/icon_128x128.png",
+        "pixels": 128
+      },
+      {
+        "file": "HandTodo.iconset/icon_128x128@2x.png",
+        "pixels": 256
+      },
+      {
+        "file": "HandTodo.iconset/icon_256x256.png",
+        "pixels": 256
+      },
+      {
+        "file": "HandTodo.iconset/icon_256x256@2x.png",
+        "pixels": 512
+      },
+      {
+        "file": "HandTodo.iconset/icon_512x512.png",
+        "pixels": 512
+      },
+      {
+        "file": "HandTodo.iconset/icon_512x512@2x.png",
+        "pixels": 1024
+      }
+    ]
+  },
+  "windows": {
+    "ico_directory_and_frame_payloads_passed": true,
+    "sizes": [
+      16,
+      20,
+      24,
+      30,
+      32,
+      36,
+      40,
+      48,
+      60,
+      64,
+      72,
+      80,
+      96,
+      128,
+      256
+    ]
+  },
+  "scope": "Icon assets only; application build settings unchanged."
+}

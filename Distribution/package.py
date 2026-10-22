@@ -49,7 +49,7 @@ def source_fingerprint():
     paths = [ROOT / "VERSION", ROOT / "build.sh"]
     for folder in ["Sources", "Windows", "Resources", "Distribution", ".github"]:
         for path in (ROOT / folder).rglob("*"):
-            if path.is_file() and not any(part in {"bin", "obj", "output", "__pycache__"} for part in path.relative_to(ROOT).parts):
+            if path.is_file() and path.name != ".DS_Store" and not any(part in {"bin", "obj", "output", "__pycache__"} for part in path.relative_to(ROOT).parts):
                 paths.append(path)
     h = hashlib.sha256()
     for path in sorted(paths):

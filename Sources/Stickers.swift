@@ -76,18 +76,19 @@ final class StickerStore {
         }
         return nil
     }
-    func bitmap() -> NSBitmapImageRep {
-        let bitmap=HandView.blank()
+    func bitmap(scale: Int = 2) -> NSBitmapImageRep {
+        let bitmap=HandView.blank(scale: scale)
         NSGraphicsContext.saveGraphicsState()
         let context=NSGraphicsContext(bitmapImageRep:bitmap)!
-        context.imageInterpolation = .high
+        context.cgContext.interpolationQuality = .high
+        context.cgContext.setShouldAntialias(true)
         context.cgContext.translateBy(x:0,y:427);context.cgContext.scaleBy(x:1,y:-1)
         NSGraphicsContext.current=NSGraphicsContext(cgContext:context.cgContext,flipped:true)
         for item in items {
             NSGraphicsContext.saveGraphicsState()
             context.cgContext.translateBy(x:item.x,y:item.y);context.cgContext.rotate(by:item.rotation)
             let size=size(item)
-            images[item.asset]!.draw(in:NSRect(x:-size.width/2,y:-size.height/2,width:size.width,height:size.height),from:.zero,operation:.sourceOver,fraction:1,respectFlipped:true,hints:nil)
+            images[item.asset]!.draw(in:NSRect(x:-size.width/2,y:-size.height/2,width:size.width,height:size.height),from:.zero,operation:.sourceOver,fraction:1,respectFlipped:true,hints:[.interpolation:NSImageInterpolation.high.rawValue])
             NSGraphicsContext.restoreGraphicsState()
         }
         NSGraphicsContext.restoreGraphicsState();return bitmap

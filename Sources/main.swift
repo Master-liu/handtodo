@@ -3,9 +3,22 @@ import AppKit
 struct Note: Codable {
     var x: Double; var y: Double; var width: Double; var height: Double
     var pigment: Data? = nil
-    var fontSize: Double? = 16
+    var detailedPigment: Data? = nil
+    var sourcePigment: Data? = nil
+    var sourceDetailedPigment: Data? = nil
+    var sourceOffsetX: Double? = nil
+    var sourceOffsetY: Double? = nil
+    var writingAngle: Double? = nil
+    var inkCoverage: Double? = nil
+    var fontSize: Double? = Double(HandView.defaultFontSize)
     var done = false; var distance = 0.0; var reversals = 0
     var rect: NSRect { NSRect(x: x, y: y, width: width, height: height) }
+}
+struct NoteRender {
+    let bitmap: NSBitmapImageRep
+    let pixelBounds: NSRect
+    let sourceBounds: NSRect
+    let detailedBounds: NSRect
 }
 struct HandWashBackup: Codable {
     let notes:[Note]
@@ -21,6 +34,10 @@ struct SmudgeSnapshot {
     let index: Int
     let note: Note
     let pixels: Data
+    let detailedPixels: Data?
+    var sourcePixels: Data? = nil
+    var sourceDetailedPixels: Data? = nil
+    var changed = false
 }
 final class HandPanel: NSPanel {
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
@@ -63,6 +80,8 @@ final class WristButton: NSControl {
     }
 }
 final class HandView: NSView, NSTextViewDelegate, NSMenuDelegate {
+    static let defaultFontSize: CGFloat = 14
+    static let eraserRadius: CGFloat = 8
     let hand = NSImage(contentsOf: Bundle.main.url(forResource: "hand", withExtension: "png")!)!
     let toolButton = WristButton(frame:NSRect(x:26,y:296,width:52,height:30))
     let mask: NSBitmapImageRep
@@ -76,12 +95,17 @@ final class HandView: NSView, NSTextViewDelegate, NSMenuDelegate {
     var displayedStickers=HandView.blank()
     var drawingStore: DrawingStore!
     var penMode = false
+    var drawingEraserMode = false
     var penColor: PenColor = .black
     var displayedDrawing = HandView.blank()
     var displayedInk = HandView.blank()
     var ink: NSBitmapImageRep
     var notes: [Note] = []
     var layers: [NSBitmapImageRep] = []
+    var detailedLayers: [NSBitmapImageRep?] = []
+    var sourceLayers: [NSBitmapImageRep?] = []
+    var sourceDetailedLayers: [NSBitmapImageRep?] = []
+    private var noteRenders: [NoteRender?] = []
     var selected: Int?
     var moving = false
     var editor: NSTextView?
@@ -92,11 +116,17 @@ final class HandView: NSView, NSTextViewDelegate, NSMenuDelegate {
     var smudgeHistory: [SmudgeSnapshot] = []
     var pendingSmudge: SmudgeSnapshot?
     var direction: CGFloat = 0
+    var eraserPoint: NSPoint?
     var interacting: Bool { editor != nil || pointerHeld }
     let folder: URL
     override var isFlipped: Bool { true }
-    static func blank() -> NSBitmapImageRep {
-        let b = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 640, pixelsHigh: 427, bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 2560, bitsPerPixel: 32)!
+    static func blank(scale: Int = 1) -> NSBitmapImageRep {
+        blank(size: NSSize(width: 640, height: 427), scale: scale)
+    }
+    static func blank(size: NSSize, scale: Int) -> NSBitmapImageRep {
+        let width = Int(ceil(size.width))*scale, height = Int(ceil(size.height))*scale
+        let b = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: width, pixelsHigh: height, bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: width*4, bitsPerPixel: 32)!
+        b.size = NSSize(width: width/scale, height: height/scale)
         b.bitmapData!.initialize(repeating: 0, count: b.bytesPerRow * b.pixelsHigh)
         return b
     }
@@ -125,7 +155,19 @@ final class HandView: NSView, NSTextViewDelegate, NSMenuDelegate {
         toolButton.toolTip = "画笔颜色与待办模式"
         addSubview(toolButton)
     }
+    func detailedBitmap(_ data: Data?) -> NSBitmapImageRep? {
+        guard let data, let image = NSBitmapImageRep(data: data), image.pixelsWide == 1280, image.pixelsHigh == 854 else { return nil }
+        let result = Self.blank(scale: 2)
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: result)
+        image.draw(in: bounds)
+        NSGraphicsContext.restoreGraphicsState()
+        return result
+    }
     func restoreLayers() {
+        sourceLayers = notes.map { sourceBitmap($0.sourcePigment, scale: 1) }
+        sourceDetailedLayers = notes.map { sourceBitmap($0.sourceDetailedPigment, scale: 2) }
+        detailedLayers = notes.map { detailedBitmap($0.detailedPigment) }
         layers = notes.map { note in
             let layer = Self.blank()
             if let data = note.pigment, let image = NSBitmapImageRep(data: data) {
@@ -166,12 +208,35 @@ final class HandView: NSView, NSTextViewDelegate, NSMenuDelegate {
         }
         rebuildInk()
     }
+    private func sourceBitmap(_ data: Data?, scale: Int) -> NSBitmapImageRep? {
+        guard let data, let image = NSBitmapImageRep(data: data) else { return nil }
+        let result = Self.blank(size: NSSize(width: image.pixelsWide/scale, height: image.pixelsHigh/scale), scale: scale)
+        NSGraphicsContext.saveGraphicsState(); NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: result)
+        image.draw(in: NSRect(origin: .zero, size: result.size))
+        NSGraphicsContext.restoreGraphicsState()
+        return result
+    }
+    func sourceOrigin(_ note: Note) -> NSPoint {
+        NSPoint(x: note.x+(note.sourceOffsetX ?? 0), y: note.y+(note.sourceOffsetY ?? 0))
+    }
+    private func projectSource(_ source: NSBitmapImageRep, note: Note, scale: Int) -> NSBitmapImageRep {
+        let result = Self.blank(scale: scale), origin = sourceOrigin(note)
+        let dx = Int((origin.x*Double(scale)).rounded()), dy = Int((origin.y*Double(scale)).rounded())
+        let left = max(0, -dx), right = min(source.pixelsWide, result.pixelsWide-dx)
+        let top = max(0, -dy), bottom = min(source.pixelsHigh, result.pixelsHigh-dy)
+        guard left < right, top < bottom else { return result }
+        for y in top..<bottom {
+            result.bitmapData!.advanced(by: (y+dy)*result.bytesPerRow+(left+dx)*4).update(from: source.bitmapData!.advanced(by: y*source.bytesPerRow+left*4), count: (right-left)*4)
+        }
+        return result
+    }
     func noteAnchor(_ note: Note) -> NSPoint { NSPoint(x: note.x, y: note.y) }
+    func noteAngle(_ note: Note) -> Double { note.writingAngle ?? surface.writingAngle(at: noteAnchor(note)) }
     func notePoint(_ p: NSPoint, note: Note) -> NSPoint {
-        surface.orient(p, anchor: noteAnchor(note), angle: surface.writingAngle(at: noteAnchor(note)))
+        surface.orient(p, anchor: noteAnchor(note), angle: noteAngle(note))
     }
     func pointInNote(_ p: NSPoint, note: Note) -> NSPoint {
-        surface.unorient(p, anchor: noteAnchor(note), angle: surface.writingAngle(at: noteAnchor(note)))
+        surface.unorient(p, anchor: noteAnchor(note), angle: noteAngle(note))
     }
     override func hitTest(_ point: NSPoint) -> NSView? {
         guard bounds.contains(point) else { return nil }
@@ -182,44 +247,71 @@ final class HandView: NSView, NSTextViewDelegate, NSMenuDelegate {
         }
         return super.hitTest(point)
     }
-    func rebuildInk() {
+    func rebuildInk(changedIndex: Int? = nil) {
+        if let i = changedIndex, noteRenders.count == layers.count { noteRenders[i] = nil }
+        else { noteRenders = Array(repeating:nil,count:layers.count) }
         ink = Self.blank()
-        let dest = ink.bitmapData!
-        for layer in layers {
-            let src = layer.bitmapData!
-            for offset in stride(from: 0, to: ink.bytesPerRow*427, by: 4) {
-                let alpha = Double(src[offset+3])/255
-                if alpha == 0 { continue }
-                for c in 0..<4 { dest[offset+c] = UInt8(min(255, (Double(src[offset+c])+Double(dest[offset+c])*(1-alpha)).rounded())) }
-            }
-        }
-        let orientedInk = Self.blank(), pixels = orientedInk.bitmapData!
+        displayedInk = Self.blank(scale: 2)
         for i in layers.indices {
-            let bitmap = surface.oriented(layers[i], anchor: noteAnchor(notes[i]), angle: surface.writingAngle(at: noteAnchor(notes[i])))
-            let source = bitmap.bitmapData!
-            for o in stride(from: 0, to: bitmap.bytesPerRow*427, by: 4) {
-                let alpha = Double(source[o+3])/255
+            if noteRenders[i] == nil {
+                let sourceBounds = HandSurface.inkBounds(layers[i])
+                let sourceLayer: NSBitmapImageRep
+                if let detail = detailedLayers[i] { sourceLayer = detail }
+                else {
+                    sourceLayer = Self.blank(scale: 2)
+                    NSGraphicsContext.saveGraphicsState()
+                    NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep:sourceLayer)
+                    layers[i].draw(in:bounds)
+                    NSGraphicsContext.restoreGraphicsState()
+                }
+                let detailedBounds = HandSurface.inkBounds(sourceLayer)
+                let anchor = noteAnchor(notes[i]), angle = noteAngle(notes[i])
+                let bitmap = surface.warpDetailed(sourceLayer,anchor:anchor,angle:angle,sourceBounds:detailedBounds)
+                noteRenders[i] = NoteRender(bitmap:bitmap,pixelBounds:surface.displayBounds(detailedBounds,anchor:anchor,angle:angle,scale:2),sourceBounds:sourceBounds,detailedBounds:detailedBounds)
+            }
+            let rendered = noteRenders[i]!
+            composite(layers[i],into:ink,pixelBounds:rendered.sourceBounds)
+            composite(rendered.bitmap,into:displayedInk,pixelBounds:rendered.pixelBounds)
+        }
+    }
+    private func composite(_ source: NSBitmapImageRep, into target: NSBitmapImageRep, pixelBounds: NSRect) {
+        guard !pixelBounds.isEmpty else { return }
+        let src = source.bitmapData!, dest = target.bitmapData!
+        for y in Int(pixelBounds.minY)..<Int(ceil(pixelBounds.maxY)) {
+            for x in Int(pixelBounds.minX)..<Int(ceil(pixelBounds.maxX)) {
+                let offset = y*source.bytesPerRow+x*4, alpha = Double(src[offset+3])/255
                 if alpha == 0 { continue }
-                for c in 0..<4 { pixels[o+c] = UInt8(min(255,(Double(source[o+c])+Double(pixels[o+c])*(1-alpha)).rounded())) }
+                for c in 0..<4 { dest[offset+c] = UInt8(min(255,(Double(src[offset+c])+Double(dest[offset+c])*(1-alpha)).rounded())) }
             }
         }
-        displayedInk = surface.warp(orientedInk)
     }
     @discardableResult func moveNote(_ i: Int, dx: Int, dy: Int) -> Bool {
         guard !notes[i].done, dx != 0 || dy != 0 else { return false }
-        let source = layers[i], moved = Self.blank()
+        // Retain the original canvas of legacy notes before their first move.
+        if sourceLayers[i] == nil {
+            sourceLayers[i] = sourceBitmap(layers[i].representation(using:.png,properties:[:]),scale:1)
+            sourceDetailedLayers[i] = sourceBitmap(detailedLayers[i]?.representation(using:.png,properties:[:]),scale:2)
+            notes[i].sourceOffsetX = -notes[i].x; notes[i].sourceOffsetY = -notes[i].y
+        }
         var proposed = notes[i]; proposed.x += Double(dx); proposed.y += Double(dy)
-        for y in 0..<427 { for x in 0..<640 {
-            let offset = y*source.bytesPerRow+x*4
-            guard source.bitmapData![offset+3] > 0 else { continue }
-            let nx = x+dx, ny = y+dy
-            guard nx >= 0, nx < 640, ny >= 0, ny < 427, onSkin(surface.display(notePoint(NSPoint(x: nx, y: ny), note: proposed))) else { return false }
-            let target = ny*moved.bytesPerRow+nx*4
-            for c in 0..<4 { moved.bitmapData![target+c] = source.bitmapData![offset+c] }
-        } }
+        // Once the first line is outside the hand, keep its last writing direction
+        // so later lines can be brought back without rotating around a remote anchor.
+        proposed.writingAngle = onSkin(surface.display(noteAnchor(proposed))) ? surface.writingAngle(at:noteAnchor(proposed)) : noteAngle(notes[i])
+        let moved = projectSource(sourceLayers[i]!, note: proposed, scale: 1)
+        let region = HandSurface.inkBounds(moved)
+        var visible = false
+        if !region.isEmpty {
+            outer: for y in Int(region.minY)..<Int(ceil(region.maxY)) { for x in Int(region.minX)..<Int(ceil(region.maxX)) {
+                if moved.bitmapData![y*moved.bytesPerRow+x*4+3] > 0 && onSkin(surface.display(notePoint(NSPoint(x:x,y:y),note:proposed))) { visible = true; break outer }
+            } }
+        }
+        guard visible else { return false }
         smudgeHistory.removeAll { $0.index == i }
-        layers[i] = moved; notes[i].x += Double(dx); notes[i].y += Double(dy)
-        rebuildInk(); needsDisplay = true; return true
+        if let detail = sourceDetailedLayers[i] {
+            detailedLayers[i] = projectSource(detail, note: proposed, scale: 2)
+        }
+        layers[i] = moved; notes[i] = proposed
+        rebuildInk(changedIndex:i); needsDisplay = true; return true
     }
     override var acceptsFirstResponder: Bool { true }
     override func keyDown(with event: NSEvent) {
@@ -231,12 +323,17 @@ final class HandView: NSView, NSTextViewDelegate, NSMenuDelegate {
     required init?(coder: NSCoder) { fatalError() }
     func save() {
         drawingStore.save(); stickerStore.save()
-        for i in notes.indices { notes[i].pigment = layers[i].representation(using: .png, properties: [:]) }
+        for i in notes.indices {
+            notes[i].pigment = layers[i].representation(using: .png, properties: [:])
+            notes[i].detailedPigment = detailedLayers[i]?.representation(using: .png, properties: [:])
+            notes[i].sourcePigment = sourceLayers[i]?.representation(using: .png, properties: [:])
+            notes[i].sourceDetailedPigment = sourceDetailedLayers[i]?.representation(using: .png, properties: [:])
+        }
         if let data = ink.representation(using: .png, properties: [:]) { try? data.write(to: folder.appendingPathComponent("ink.png"), options: .atomic) }
         if let data = try? JSONEncoder().encode(notes) { try? data.write(to: folder.appendingPathComponent("notes.json"), options: .atomic) }
     }
     override func draw(_ dirtyRect: NSRect) {
-        hand.draw(in: bounds, from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: true, hints: nil)
+        hand.draw(in: bounds, from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: true, hints: [.interpolation:NSImageInterpolation.high.rawValue])
         let image = NSImage(size: bounds.size); image.addRepresentation(displayedInk)
         image.draw(in: bounds, from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: true, hints: nil)
         let art = NSImage(size:bounds.size); art.addRepresentation(displayedDrawing)
@@ -244,6 +341,19 @@ final class HandView: NSView, NSTextViewDelegate, NSMenuDelegate {
         let stickers=NSImage(size:bounds.size);stickers.addRepresentation(displayedStickers)
         stickers.draw(in:bounds,from:.zero,operation:.sourceOver,fraction:1,respectFlipped:true,hints:nil)
         (editor as? SurfaceTextView)?.drawOnHand()
+        if let point = eraserPoint, !moving, !stickerMode, (penMode && drawingEraserMode || !penMode && active != nil) {
+            let ring = NSBezierPath()
+            for step in 0...32 {
+                let angle = Double(step)*2 * .pi/32
+                let local = NSPoint(x:point.x+cos(angle)*Self.eraserRadius,y:point.y+sin(angle)*Self.eraserRadius)
+                let oriented = penMode ? local : notePoint(local,note:notes[active!])
+                let p = surface.display(oriented)
+                if step == 0 { ring.move(to:p) } else { ring.line(to:p) }
+            }
+            ring.close()
+            NSColor.black.withAlphaComponent(0.25).setStroke();ring.lineWidth=2;ring.stroke()
+            NSColor.white.withAlphaComponent(0.9).setStroke();ring.lineWidth=1;ring.stroke()
+        }
     }
     func onSkin(_ p: NSPoint) -> Bool {
         guard bounds.contains(p) else { return false }
@@ -261,11 +371,37 @@ final class HandView: NSView, NSTextViewDelegate, NSMenuDelegate {
         return false
     }
 
+    static func segmentDistanceSquared(_ point: NSPoint, from start: NSPoint, to end: NSPoint) -> Double {
+        let dx = end.x-start.x, dy = end.y-start.y, length = dx*dx+dy*dy
+        let t = length > 0 ? max(0,min(1,((point.x-start.x)*dx+(point.y-start.y)*dy)/length)) : 0
+        let x = point.x-start.x-t*dx, y = point.y-start.y-t*dy
+        return x*x+y*y
+    }
+    private func eraserBounds(from start: NSPoint, to end: NSPoint) -> NSRect {
+        NSRect(x:min(start.x,end.x)-Self.eraserRadius,y:min(start.y,end.y)-Self.eraserRadius,width:abs(end.x-start.x)+2*Self.eraserRadius,height:abs(end.y-start.y)+2*Self.eraserRadius).intersection(bounds)
+    }
+    func eraserTouches(from start: NSPoint, to end: NSPoint, index: Int) -> Bool {
+        let a = pointInNote(start,note:notes[index]), b = pointInNote(end,note:notes[index])
+        let cached = noteRenders.count == layers.count ? noteRenders[index]?.sourceBounds : nil
+        let region = eraserBounds(from:a,to:b).intersection(cached ?? HandSurface.inkBounds(layers[index]))
+        guard !region.isEmpty else { return false }
+        let bitmap = layers[index], pixels = bitmap.bitmapData!
+        for y in Int(floor(region.minY))..<Int(ceil(region.maxY)) { for x in Int(floor(region.minX))..<Int(ceil(region.maxX)) {
+            if pixels[y*bitmap.bytesPerRow+x*4+3] > 0 && Self.segmentDistanceSquared(NSPoint(x:x,y:y),from:a,to:b) < Self.eraserRadius*Self.eraserRadius { return true }
+        } }
+        return false
+    }
+    static func coverage(_ bitmap: NSBitmapImageRep) -> Double {
+        let pixels = bitmap.bitmapData!
+        var total = 0.0
+        for y in 0..<bitmap.pixelsHigh { for x in 0..<bitmap.pixelsWide { total += Double(pixels[y*bitmap.bytesPerRow+x*4+3])/255 } }
+        return total
+    }
     override func mouseDown(with event: NSEvent) {
         let displayPoint = convert(event.locationInWindow, from: nil)
         let p = surface.canonical(displayPoint)
         if editor != nil { commit() }
-        pendingClick = nil; pointerHeld = false
+        pendingClick = nil; pointerHeld = false; eraserPoint = nil
         guard onSkin(displayPoint) else { return }
         pointerHeld = true
         if stickerMode {
@@ -274,19 +410,24 @@ final class HandView: NSView, NSTextViewDelegate, NSMenuDelegate {
             window?.makeKey();window?.makeFirstResponder(self);return
         }
         if penMode {
-            drawingStore.begin(p,color:penColor); refreshDrawing(); return
+            window?.makeKey();window?.makeFirstResponder(self)
+            if drawingEraserMode { eraserPoint=p;drawingStore.beginErasing(p) }
+            else { drawingStore.begin(p,color:penColor) }
+            refreshDrawing();return
         }
-        if let i = notes.indices.reversed().first(where: { !notes[$0].done && inkContains(p,index:$0) }) {
+        let wantsMove = event.modifierFlags.contains(.option)
+        if let i = notes.indices.reversed().first(where: { !notes[$0].done && (wantsMove ? inkContains(p,index:$0) : eraserTouches(from:p,to:p,index:$0)) }) {
             if notes[i].done { return }
             moving = event.modifierFlags.contains(.option)
             selected = i
             window?.makeKey(); window?.makeFirstResponder(self)
-            active = i; last = moving ? p : pointInNote(p, note: notes[i]); direction = 0; needsDisplay = true; return
+            active = i; last = moving ? p : pointInNote(p, note: notes[i]); direction = 0
+            eraserPoint = moving ? nil : last; needsDisplay = true; return
         }
         selected = nil; needsDisplay = true
         if !event.modifierFlags.contains(.option) { pendingClick = PendingClick(point:displayPoint,timestamp:event.timestamp) }
     }
-    func refreshStickers() { displayedStickers=surface.warp(stickerStore.bitmap());needsDisplay=true }
+    func refreshStickers() { displayedStickers=surface.warpDetailed(stickerStore.bitmap());needsDisplay=true }
     func addSticker(_ asset:String) {
         setPen(nil);stickerMode=true;stickerStore.add(asset);refreshStickers()
     }
@@ -322,14 +463,15 @@ final class HandView: NSView, NSTextViewDelegate, NSMenuDelegate {
     func menuDidClose(_ menu:NSMenu) { stickerMenuOpen=false }
     override func magnify(with event:NSEvent) { if stickerMode { changeSticker(factor:max(0.1,1+Double(event.magnification))) } else { super.magnify(with:event) } }
     override func rotate(with event:NSEvent) { if stickerMode { changeSticker(angle: -Double(event.rotation) * .pi/180) } else { super.rotate(with:event) } }
-    func refreshDrawing() { displayedDrawing = surface.warp(drawingStore.bitmap()); needsDisplay = true }
-    func setPen(_ color:PenColor?) {
+    func refreshDrawing() { displayedDrawing = surface.warpDetailed(drawingStore.bitmap()); needsDisplay = true }
+    func setPen(_ color:PenColor?, erasing: Bool = false) {
         if editor != nil { commit() }
-        drawingStore.finish(); pointerHeld=false; pendingClick=nil; last=nil; active=nil; moving=false
+        drawingStore.finish(); pointerHeld=false; pendingClick=nil; last=nil; active=nil; moving=false;eraserPoint=nil
         toolButton.isEnabled=true
-        toolButton.inkColor = color?.ink ?? NSColor(calibratedRed:0.31,green:0.20,blue:0.19,alpha:1)
+        toolButton.inkColor = erasing ? NSColor.darkGray : color?.ink ?? NSColor(calibratedRed:0.31,green:0.20,blue:0.19,alpha:1)
         stickerMode=false;stickerDragPoint=nil
-        penMode = color != nil
+        penMode = color != nil || erasing
+        drawingEraserMode = erasing
         if let color { penColor=color }
     }
     var hasHandContent:Bool {
@@ -347,7 +489,7 @@ final class HandView: NSView, NSTextViewDelegate, NSMenuDelegate {
             try data.write(to:folder.appendingPathComponent("wash-backup.json"),options:.atomic)
         } catch { NSSound.beep();return false }
         washBackup=backup
-        notes=[];layers=[];smudgeHistory=[];pendingSmudge=nil
+        notes=[];layers=[];detailedLayers=[];sourceLayers=[];sourceDetailedLayers=[];smudgeHistory=[];pendingSmudge=nil
         selected=nil;active=nil;last=nil;pendingClick=nil;stickerDragPoint=nil;stickerDragRecorded=false
         drawingStore.replaceAll([]);stickerStore.replaceAll([])
         rebuildInk();refreshDrawing();refreshStickers();save()
@@ -410,8 +552,8 @@ final class HandView: NSView, NSTextViewDelegate, NSMenuDelegate {
         field.textContainer?.widthTracksTextView = true; field.textContainer?.heightTracksTextView = false
         field.textContainer?.containerSize = NSSize(width: frame.width, height: .greatestFiniteMagnitude)
         let paragraph = NSMutableParagraphStyle(); paragraph.lineBreakMode = .byWordWrapping; paragraph.lineSpacing = 2
-        field.typingAttributes = [.font: handwriting(16), .foregroundColor: NSColor(calibratedRed: 0.24, green: 0.19, blue: 0.40, alpha: 0.92), .paragraphStyle: paragraph]
-        field.font = handwriting(16); field.textColor = NSColor(calibratedRed: 0.24, green: 0.19, blue: 0.40, alpha: 0.92)
+        field.typingAttributes = [.font: handwriting(Self.defaultFontSize), .foregroundColor: NSColor(calibratedRed: 0.24, green: 0.19, blue: 0.40, alpha: 0.92), .paragraphStyle: paragraph]
+        field.font = handwriting(Self.defaultFontSize); field.textColor = NSColor(calibratedRed: 0.24, green: 0.19, blue: 0.40, alpha: 0.92)
         field.defaultParagraphStyle = paragraph
         field.insertionPointColor = field.textColor!
         field.delegate = self
@@ -421,25 +563,8 @@ final class HandView: NSView, NSTextViewDelegate, NSMenuDelegate {
         guard let field = editor, let manager = field.layoutManager, let container = field.textContainer else { return }
         manager.ensureLayout(for: container)
         let height = max(32, ceil(manager.usedRect(for: container).maxY)+46)
-        field.setFrameSize(NSSize(width: field.frame.width, height: min(height, bounds.maxY-field.frame.minY)))
+        field.setFrameSize(NSSize(width: field.frame.width, height: height))
         needsDisplay = true
-    }
-    func textView(_ textView: NSTextView, shouldChangeTextIn affectedCharRange: NSRange, replacementString: String?) -> Bool {
-        guard let replacementString else { return true }
-        let proposed = (textView.string as NSString).replacingCharacters(in: affectedCharRange, with: replacementString)
-        let attrs = textView.typingAttributes
-        let height = NSAttributedString(string: proposed, attributes: attrs).boundingRect(with: NSSize(width: textView.frame.width, height: .greatestFiniteMagnitude), options: [.usesLineFragmentOrigin, .usesFontLeading]).height
-        if ceil(height)+24 > bounds.maxY-textView.frame.minY { NSSound.beep(); return false }
-        if let field = textView as? SurfaceTextView, abs(field.angle) > 0.001 {
-            let used = NSAttributedString(string: proposed, attributes: attrs).boundingRect(with: NSSize(width: textView.frame.width, height: .greatestFiniteMagnitude), options: [.usesLineFragmentOrigin, .usesFontLeading])
-            for y in stride(from: 4.0, through: max(4,ceil(used.height)-2), by: 4) {
-                for x in stride(from: 2.0, through: max(2,min(textView.frame.width,ceil(used.width))-2), by: 4) {
-                    let p = surface.display(surface.orient(NSPoint(x:field.anchor.x+x,y:field.anchor.y+y),anchor:field.anchor,angle:field.angle))
-                    if !onSkin(p) { NSSound.beep(); return false }
-                }
-            }
-        }
-        return true
     }
     func textView(_ textView: NSTextView, doCommandBy selector: Selector) -> Bool {
         if selector == #selector(NSResponder.insertNewline(_:)), !textView.hasMarkedText() {
@@ -459,27 +584,29 @@ final class HandView: NSView, NSTextViewDelegate, NSMenuDelegate {
             let used = manager.usedRect(for: container)
             let width = min(field.frame.width, ceil(used.maxX)+2)
             let rect = NSRect(x: field.frame.minX+field.textContainerOrigin.x, y: field.frame.minY+field.textContainerOrigin.y, width: width, height: ceil(used.maxY)+2)
-            let layer = Self.blank()
-            let ctx = NSGraphicsContext(bitmapImageRep: layer)!
-            NSGraphicsContext.saveGraphicsState(); NSGraphicsContext.current = ctx
-            ctx.cgContext.translateBy(x: 0, y: 427); ctx.cgContext.scaleBy(x: 1, y: -1)
-            NSGraphicsContext.current = NSGraphicsContext(cgContext: ctx.cgContext, flipped: true)
-            manager.drawGlyphs(forGlyphRange: manager.glyphRange(for: container), at: rect.origin)
-            NSGraphicsContext.restoreGraphicsState()
-            layers.append(layer)
-            notes.append(Note(x: rect.minX, y: rect.minY, width: rect.width, height: rect.height))
+            let surfaceField = field as! SurfaceTextView
+            let source = surfaceField.contentBitmap(scale: 1), detail = surfaceField.contentBitmap(scale: 2)
+            sourceLayers.append(source); sourceDetailedLayers.append(detail)
+            let note = Note(x: rect.minX, y: rect.minY, width: rect.width, height: rect.height, sourceOffsetX: surfaceField.contentOrigin.x-rect.minX, sourceOffsetY: surfaceField.contentOrigin.y-rect.minY, writingAngle: surfaceField.angle, inkCoverage: Self.coverage(source))
+            notes.append(note)
+            layers.append(projectSource(source,note:note,scale:1))
+            detailedLayers.append(projectSource(detail,note:note,scale:2))
             rebuildInk()
         }
         field.removeFromSuperview(); editor = nil; window?.makeFirstResponder(self); needsDisplay = true; save()
     }
     func beginSmudge(_ i: Int) {
         guard pendingSmudge == nil else { return }
-        pendingSmudge = SmudgeSnapshot(index: i, note: notes[i], pixels: Data(bytes: layers[i].bitmapData!, count: layers[i].bytesPerRow*427))
+        if notes[i].inkCoverage == nil { notes[i].inkCoverage = Self.coverage(layers[i]) }
+        let detail = detailedLayers[i].map { Data(bytes:$0.bitmapData!,count:$0.bytesPerRow*$0.pixelsHigh) }
+        let source = sourceLayers[i].map { Data(bytes:$0.bitmapData!,count:$0.bytesPerRow*$0.pixelsHigh) }
+        let sourceDetail = sourceDetailedLayers[i].map { Data(bytes:$0.bitmapData!,count:$0.bytesPerRow*$0.pixelsHigh) }
+        pendingSmudge = SmudgeSnapshot(index:i,note:notes[i],pixels:Data(bytes:layers[i].bitmapData!,count:layers[i].bytesPerRow*427),detailedPixels:detail,sourcePixels:source,sourceDetailedPixels:sourceDetail)
     }
     func finishSmudge() {
         if let snapshot = pendingSmudge {
             let current = Data(bytes: layers[snapshot.index].bitmapData!, count: layers[snapshot.index].bytesPerRow*427)
-            if current != snapshot.pixels || notes[snapshot.index].done != snapshot.note.done || notes[snapshot.index].distance != snapshot.note.distance || notes[snapshot.index].reversals != snapshot.note.reversals {
+            if snapshot.changed || current != snapshot.pixels || notes[snapshot.index].done != snapshot.note.done || notes[snapshot.index].distance != snapshot.note.distance || notes[snapshot.index].reversals != snapshot.note.reversals {
                 smudgeHistory.append(snapshot)
                 if smudgeHistory.count > 30 { smudgeHistory.removeFirst() }
             }
@@ -494,6 +621,17 @@ final class HandView: NSView, NSTextViewDelegate, NSMenuDelegate {
         }
         notes[snapshot.index] = snapshot.note
         layers[snapshot.index] = restored
+        if let pixels = snapshot.detailedPixels {
+            let detail = Self.blank(scale:2)
+            pixels.withUnsafeBytes { detail.bitmapData!.update(from:$0.bindMemory(to:UInt8.self).baseAddress!,count:pixels.count) }
+            detailedLayers[snapshot.index] = detail
+        } else { detailedLayers[snapshot.index] = nil }
+        if let pixels = snapshot.sourcePixels, let source = sourceLayers[snapshot.index] {
+            pixels.withUnsafeBytes { source.bitmapData!.update(from:$0.bindMemory(to:UInt8.self).baseAddress!,count:pixels.count) }
+        }
+        if let pixels = snapshot.sourceDetailedPixels, let source = sourceDetailedLayers[snapshot.index] {
+            pixels.withUnsafeBytes { source.bitmapData!.update(from:$0.bindMemory(to:UInt8.self).baseAddress!,count:pixels.count) }
+        }
         selected = snapshot.note.done ? nil : snapshot.index
         rebuildInk(); needsDisplay = true; save()
     }
@@ -508,14 +646,19 @@ final class HandView: NSView, NSTextViewDelegate, NSMenuDelegate {
             return
         }
         if penMode {
-            drawingStore.append(surface.canonical(displayPoint),inside:onSkin(displayPoint)); refreshDrawing(); return
+            let point=surface.canonical(displayPoint)
+            if drawingEraserMode { eraserPoint=point }
+            drawingStore.append(point,inside:drawingEraserMode || onSkin(displayPoint)); refreshDrawing(); return
         }
         if let click = pendingClick, hypot(displayPoint.x-click.point.x,displayPoint.y-click.point.y) > 4 { pendingClick?.moved = true }
         let handPoint = surface.canonical(displayPoint)
         if active == nil, pendingClick?.moved == true {
-            if let i = notes.indices.reversed().first(where:{ !notes[$0].done && notes[$0].rect.insetBy(dx:-18,dy:-18).contains(pointInNote(handPoint,note:notes[$0])) }) {
-                active = i; moving = false; last = pointInNote(handPoint,note:notes[i]); direction = 0
-                pendingClick = nil
+            if let click = pendingClick {
+                let start = surface.canonical(click.point)
+                if let i = notes.indices.reversed().first(where:{ !notes[$0].done && eraserTouches(from:start,to:handPoint,index:$0) }) {
+                    active = i; moving = false; last = pointInNote(start,note:notes[i]); direction = 0
+                    pendingClick = nil
+                }
             }
         }
         guard let before = last, let i = active else { return }
@@ -526,63 +669,93 @@ final class HandView: NSView, NSTextViewDelegate, NSMenuDelegate {
             if moveNote(i, dx: Int(dx.rounded()), dy: Int(dy.rounded())) { last = p }
             return
         }
-        if notes[i].rect.insetBy(dx: -24, dy: -24).contains(p) {
+        eraserPoint = p
+        if !notes[i].done {
             beginSmudge(i)
-            let sign: CGFloat = abs(dx) > abs(dy) ? (dx > 0 ? 1 : -1) : (dy > 0 ? 1 : -1)
-            if direction != 0 && sign != direction && length > 2 { notes[i].reversals += 1 }
-            if length > 2 { direction = sign }
-            notes[i].distance += min(length, 30)
             ink = layers[i]
-            let steps = max(1, Int(length/3))
-            for step in 1...min(steps, 100) {
-                let t = CGFloat(step)/CGFloat(min(steps, 100))
-                smudge(NSPoint(x: before.x+dx*t, y: before.y+dy*t), dx: dx/CGFloat(steps), dy: dy/CGFloat(steps))
+            let changed = smudge(p,dx:dx,dy:dy)
+            layers[i] = ink
+            if changed {
+                let remaining = Self.coverage(sourceLayers[i] ?? layers[i]), original = notes[i].inkCoverage ?? remaining
+                if original > 0 && remaining <= original*0.01 {
+                    layers[i] = Self.blank()
+                    if detailedLayers[i] != nil { detailedLayers[i] = Self.blank(scale:2) }
+                    for source in [sourceLayers[i],sourceDetailedLayers[i]].compactMap({$0}) {
+                        source.bitmapData!.initialize(repeating:0,count:source.bytesPerRow*source.pixelsHigh)
+                    }
+                    notes[i].done = true
+                }
+                rebuildInk(changedIndex:i)
             }
-            layers[i] = ink; rebuildInk()
-            if notes[i].distance > max(240, notes[i].width*3) && notes[i].reversals >= 3 { notes[i].done = true }
-            needsDisplay = true
         }
+        needsDisplay = true
         last = p
     }
-    func smudge(_ p: NSPoint, dx: CGFloat, dy: CGFloat) {
-        guard bounds.contains(p) else { return }
-        let radius = 23.0, copy = Array(UnsafeBufferPointer(start: ink.bitmapData!, count: ink.bytesPerRow*427))
-        let pixels = ink.bitmapData!
-        for y in max(0, Int(p.y-radius))...min(426, max(0, Int(p.y+radius))) {
-            for x in max(0, Int(p.x-radius))...min(639, max(0, Int(p.x+radius))) {
-                let d = hypot(Double(x)-p.x, Double(y)-p.y)
-                if d >= radius || !onSkin(surface.display(active.map { notePoint(NSPoint(x: x, y: y), note: notes[$0]) } ?? NSPoint(x: x, y: y))) { continue }
-                let weight = (1-d/radius)*0.72
-                let sx = min(639, max(0, x-Int((dx*2).rounded())))
-                let sy = min(426, max(0, y-Int((dy*2).rounded())))
-                let dest = y*ink.bytesPerRow+x*4, source = sy*ink.bytesPerRow+sx*4
-                for c in 0..<4 {
-                    let value = Double(copy[dest+c])*(1-weight)+Double(copy[source+c])*weight
-                    pixels[dest+c] = UInt8(max(0, min(255, value.rounded())))
+    // Keep the existing undo entry points; erasing now only removes pigment in place.
+    @discardableResult func smudge(_ p: NSPoint, dx: CGFloat, dy: CGFloat) -> Bool {
+        let start = NSPoint(x:p.x-dx,y:p.y-dy)
+        var changed = eraseBitmap(ink,from:start,to:p)
+        if let i = active ?? pendingSmudge?.index, let detail = detailedLayers[i] {
+            changed = eraseBitmap(detail,from:start,to:p) || changed
+        }
+        if let i = active ?? pendingSmudge?.index {
+            let origin = sourceOrigin(notes[i])
+            if let source = sourceLayers[i] { changed = eraseBitmap(source,from:start,to:p,scale:1,origin:origin) || changed }
+            if let source = sourceDetailedLayers[i] { changed = eraseBitmap(source,from:start,to:p,scale:2,origin:origin) || changed }
+        }
+        if changed { pendingSmudge?.changed = true }
+        return changed
+    }
+    @discardableResult func eraseBitmap(_ bitmap: NSBitmapImageRep, from start: NSPoint, to end: NSPoint, scale explicitScale: Double? = nil, origin: NSPoint = .zero) -> Bool {
+        let scale = explicitScale ?? Double(bitmap.pixelsWide)/640
+        let region = eraserBounds(from:start,to:end).intersection(NSRect(origin:origin,size:NSSize(width:Double(bitmap.pixelsWide)/scale,height:Double(bitmap.pixelsHigh)/scale)))
+        guard !region.isEmpty else { return false }
+        let radius = Self.eraserRadius, edge: CGFloat = 0.75
+        let coreSquared = (radius-edge)*(radius-edge), radiusSquared = radius*radius
+        let pixels = bitmap.bitmapData!
+        var changed = false
+        for y in max(0,Int(floor((region.minY-origin.y)*scale)))..<min(bitmap.pixelsHigh,Int(ceil((region.maxY-origin.y)*scale))) {
+            for x in max(0,Int(floor((region.minX-origin.x)*scale)))..<min(bitmap.pixelsWide,Int(ceil((region.maxX-origin.x)*scale))) {
+                let offset = y*bitmap.bytesPerRow+x*4
+                guard pixels[offset+3] > 0 else { continue }
+                let d = Self.segmentDistanceSquared(NSPoint(x:origin.x+Double(x)/scale,y:origin.y+Double(y)/scale),from:start,to:end)
+                guard d < radiusSquared else { continue }
+                let keep = d <= coreSquared ? 0 : (sqrt(d)-(radius-edge))/edge
+                let alpha = UInt8((Double(pixels[offset+3])*keep).rounded())
+                if alpha >= pixels[offset+3] { continue }
+                if alpha <= 3 {
+                    for c in 0..<4 { pixels[offset+c] = 0 }
+                } else {
+                    for c in 0..<4 { pixels[offset+c] = UInt8((Double(pixels[offset+c])*keep).rounded()) }
                 }
+                changed = true
             }
         }
+        return changed
     }
     override func mouseUp(with event: NSEvent) {
         if stickerMode { pointerHeld=false;stickerDragPoint=nil;stickerDragRecorded=false;stickerStore.save();return }
         if penMode {
             let p=convert(event.locationInWindow,from:nil)
-            drawingStore.append(surface.canonical(p),inside:onSkin(p)); drawingStore.finish()
-            pointerHeld=false; refreshDrawing(); return
+            drawingStore.append(surface.canonical(p),inside:drawingEraserMode || onSkin(p)); drawingStore.finish()
+            pointerHeld=false;eraserPoint=nil;refreshDrawing();return
         }
+        // Include the release position when event coalescing skipped the final drag sample.
+        if !moving && (pendingSmudge != nil || pendingClick?.moved == true) { mouseDragged(with:event) }
         let released = convert(event.locationInWindow,from:nil)
         let click = pendingClick
         let shouldCreate = active == nil && click.map {
             !$0.moved && event.timestamp-$0.timestamp <= 0.35 && hypot(released.x-$0.point.x,released.y-$0.point.y) <= 4
         } == true
-        finishSmudge(); last = nil; active = nil; moving = false; pointerHeld = false; pendingClick = nil
+        finishSmudge(); last = nil; active = nil; moving = false; pointerHeld = false; pendingClick = nil; eraserPoint = nil
+        needsDisplay = true
         save()
         if shouldCreate, let click, onSkin(released) { startEditor(at:click.point) }
     }
 }
 enum SelfPreview {
-    static func make(_ view: HandView) -> Data {
-        let bitmap = HandView.blank()
+    static func make(_ view: HandView, scale: Int = 1) -> Data {
+        let bitmap = HandView.blank(scale: scale)
         view.cacheDisplay(in: view.bounds, to: bitmap)
         return bitmap.representation(using: .png, properties: [:])!
     }
@@ -617,17 +790,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         status.button?.image = NSImage(systemSymbolName: "hand.raised.fill", accessibilityDescription: "掌上待办")
         let menu = NSMenu()
         menu.addItem(withTitle: "伸出手", action: #selector(reveal), keyEquivalent: "")
-        menu.addItem(withTitle: "撤销上次涂抹", action: #selector(undoRub), keyEquivalent: "z")
+        menu.addItem(withTitle: "撤销上次擦除", action: #selector(undoRub), keyEquivalent: "z")
         menu.addItem(NSMenuItem.separator())
         menu.addItem(withTitle:"待办模式",action:#selector(chooseTodo),keyEquivalent:"")
         for (title,tag) in [("画笔 · 黑色",1),("画笔 · 红色",2),("画笔 · 蓝色",3)] {
             let item=NSMenuItem(title:title,action:#selector(choosePen(_:)),keyEquivalent:""); item.tag=tag; menu.addItem(item)
         }
+        menu.addItem(withTitle:"涂鸦橡皮擦",action:#selector(chooseDrawingEraser),keyEquivalent:"")
         menu.addItem(withTitle:"撤销涂画",action:#selector(undoDrawing),keyEquivalent:"")
         menu.addItem(withTitle:"清空涂画",action:#selector(clearDrawing),keyEquivalent:"")
         appendStickerItems(to:menu)
         menu.addItem(NSMenuItem.separator())
-        let help = NSMenuItem(title: "直接拖动揉墨 · ⌥拖动移动文字", action: nil, keyEquivalent: ""); help.isEnabled = false; menu.addItem(help)
+        let help = NSMenuItem(title: "直接拖动擦除 · ⌥拖动移动文字", action: nil, keyEquivalent: ""); help.isEnabled = false; menu.addItem(help)
         menu.addItem(NSMenuItem.separator())
         menu.addItem(withTitle: "退出掌上待办", action: #selector(quit), keyEquivalent: "q")
         for item in menu.items where item.action != nil { item.target = self }; status.menu = menu
@@ -680,6 +854,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             let item=NSMenuItem(title:title,action:#selector(choosePen(_:)),keyEquivalent:""); item.tag=tag; menu.addItem(item)
         }
         menu.addItem(NSMenuItem.separator())
+        menu.addItem(withTitle:"涂鸦橡皮擦",action:#selector(chooseDrawingEraser),keyEquivalent:"")
         menu.addItem(withTitle:"撤销涂画",action:#selector(undoDrawing),keyEquivalent:"")
         menu.addItem(withTitle:"清空涂画",action:#selector(clearDrawing),keyEquivalent:"")
         appendStickerItems(to:menu)
@@ -707,16 +882,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
         if menuItem.action == #selector(undoRub) {
             if canvas.canUndoWash { menuItem.title="撤销洗手";return true }
-            menuItem.title = canvas.stickerMode ? "撤销图案操作" : canvas.penMode ? "撤销上一笔" : "撤销上次涂抹"
+            menuItem.title = canvas.stickerMode ? "撤销图案操作" : canvas.penMode ? "撤销涂画操作" : "撤销上次擦除"
             return (canvas.stickerMode ? canvas.stickerStore.canUndo : canvas.penMode ? canvas.drawingStore.canUndo : !canvas.smudgeHistory.isEmpty) && canvas.editor == nil && !canvas.pointerHeld
         }
         if menuItem.action == #selector(washHand) { return canvas.hasHandContent && !canvas.pointerHeld }
         if menuItem.action == #selector(undoHandWash) { return canvas.canUndoWash }
         if menuItem.action == #selector(chooseTodo) { menuItem.state = canvas.penMode || canvas.stickerMode ? .off:.on }
+        if menuItem.action == #selector(chooseDrawingEraser) { menuItem.state=canvas.drawingEraserMode ? .on:.off }
         if menuItem.action == #selector(chooseStickers) { menuItem.state=canvas.stickerMode ? .on:.off }
         if menuItem.action == #selector(choosePen(_:)) {
             let color:PenColor = menuItem.tag == 1 ? .black : menuItem.tag == 2 ? .red:.blue
-            menuItem.state = canvas.penMode && canvas.penColor == color ? .on:.off
+            menuItem.state = canvas.penMode && !canvas.drawingEraserMode && canvas.penColor == color ? .on:.off
         }
         if menuItem.action == #selector(undoDrawing) { return canvas.drawingStore.canUndo && !canvas.pointerHeld }
         if menuItem.action == #selector(clearDrawing) { return !canvas.drawingStore.strokes.isEmpty && !canvas.pointerHeld }
@@ -735,6 +911,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         status.button?.contentTintColor=canvas.penColor.ink
         if !shown { reveal() }
     }
+    @objc func chooseDrawingEraser() {
+        canvas.setPen(nil,erasing:true)
+        status.button?.image=NSImage(systemSymbolName:"eraser",accessibilityDescription:"涂鸦橡皮擦")
+        status.button?.contentTintColor=nil
+        if !shown { reveal() }
+    }
     @objc func undoDrawing() { canvas.drawingStore.undo(); canvas.refreshDrawing() }
     @objc func clearDrawing() { canvas.drawingStore.clear(); canvas.refreshDrawing() }
     @objc func undoRub() { canvas.undoCurrent(); if !shown { reveal() } }
@@ -746,6 +928,46 @@ final class ToolActionProbe: NSObject {
     @objc func openTools(_ sender:Any?) { count += 1 }
 }
 let app = NSApplication.shared
+if CommandLine.arguments.contains("--drag-benchmark") || CommandLine.arguments.contains("--erase-benchmark") {
+    let folder = FileManager.default.temporaryDirectory.appendingPathComponent("HandTodo-Drag-"+UUID().uuidString)
+    let view = HandView(storage:folder)
+    for _ in 0..<8 {
+        let input = view.makeEditor(frame:NSRect(x:190,y:200,width:190,height:32))
+        input.string = "下午交稿拿快递";view.editor=input;view.commit()
+    }
+    if CommandLine.arguments.contains("--erase-benchmark") {
+        let window = HandPanel(contentRect:view.bounds,styleMask:[.borderless,.nonactivatingPanel],backing:.buffered,defer:false)
+        window.contentView=view
+        let low = Data(bytes:view.layers[0].bitmapData!,count:view.layers[0].bytesPerRow*427)
+        let high = Data(bytes:view.detailedLayers[0]!.bitmapData!,count:view.detailedLayers[0]!.bytesPerRow*854)
+        var timings:[Double]=[]
+        for _ in 0..<12 {
+            low.withUnsafeBytes { view.layers[0].bitmapData!.update(from:$0.bindMemory(to:UInt8.self).baseAddress!,count:low.count) }
+            high.withUnsafeBytes { view.detailedLayers[0]!.bitmapData!.update(from:$0.bindMemory(to:UInt8.self).baseAddress!,count:high.count) }
+            view.notes[0].done=false;view.notes[0].distance=0;view.notes[0].reversals=0
+            view.pendingSmudge=nil;view.rebuildInk(changedIndex:0)
+            view.active=0;view.moving=false;view.pointerHeld=true;view.last=NSPoint(x:195,y:208)
+            let target=view.surface.display(view.notePoint(NSPoint(x:270,y:208),note:view.notes[0]))
+            let event=NSEvent.mouseEvent(with:.leftMouseDragged,location:view.convert(target,to:nil),modifierFlags:[],timestamp:0,windowNumber:window.windowNumber,context:nil,eventNumber:1,clickCount:1,pressure:1)!
+            let start=ProcessInfo.processInfo.systemUptime
+            view.mouseDragged(with:event)
+            timings.append((ProcessInfo.processInfo.systemUptime-start)*1000)
+        }
+        print("ERASE: 8 notes, 75 point pointer segment including undo snapshot, mean \(timings.reduce(0,+)/Double(timings.count)) ms, max \(timings.max()!) ms")
+        try? FileManager.default.removeItem(at:folder)
+        exit(0)
+    }
+    var times:[Double]=[]
+    for _ in 0..<12 {
+        let start = ProcessInfo.processInfo.systemUptime
+        precondition(view.moveNote(0,dx:1,dy:0))
+        times.append((ProcessInfo.processInfo.systemUptime-start)*1000)
+        precondition(view.moveNote(0,dx:-1,dy:0))
+    }
+    print("DRAG: 8 notes, mean \(times.reduce(0,+)/Double(times.count)) ms, max \(times.max()!) ms")
+    try? FileManager.default.removeItem(at:folder)
+    exit(0)
+}
 if CommandLine.arguments.contains("--self-test") {
     let testOutput=Bundle.main.bundleURL.deletingLastPathComponent()
     var trigger = EdgeTrigger()
@@ -757,6 +979,113 @@ if CommandLine.arguments.contains("--self-test") {
     precondition(!EdgeTrigger.staysOpen(atEdge: false, inPanel: false, dragging: false), "Leaving must hide immediately")
     precondition(EdgeTrigger.staysOpen(atEdge: false, inPanel: false, dragging: true), "Dragging must remain uninterrupted")
     let temp = FileManager.default.temporaryDirectory.appendingPathComponent("HandTodo-"+UUID().uuidString)
+    func eraserPixels(_ bitmap: NSBitmapImageRep) -> Data {
+        Data(bytes:bitmap.bitmapData!,count:bitmap.bytesPerRow*bitmap.pixelsHigh)
+    }
+    let eraseView = HandView(storage:temp.appendingPathComponent("precise-erasing"))
+    for scale in [1,2] {
+        let solid = HandView.blank(scale:scale)
+        for y in 195*scale..<225*scale { for x in 180*scale..<290*scale {
+            let o=y*solid.bytesPerRow+x*4
+            for (c,value) in [UInt8(100),60,150,255].enumerated() { solid.bitmapData![o+c]=value }
+        } }
+        let original = eraserPixels(solid)
+        precondition(eraseView.eraseBitmap(solid,from:NSPoint(x:190,y:208),to:NSPoint(x:280,y:208)), "A fast pointer segment must erase continuously")
+        for x in 190*scale..<280*scale {
+            let o=208*scale*solid.bytesPerRow+x*4
+            precondition((0..<4).allSatisfy { solid.bitmapData![o+$0] == 0 }, "The eraser core must be completely clean without gaps")
+        }
+        let outside=218*scale*solid.bytesPerRow+220*scale*4
+        precondition(solid.bitmapData![outside+3] == 255, "Pigment outside the small eraser radius must remain untouched")
+        let result = eraserPixels(solid)
+        precondition(zip(original,result).allSatisfy { $1 <= $0 }, "Erasing must never move pigment, spread color or darken any pixel")
+    }
+    for (y,text) in [(200.0,"擦除精度测试"),(230.0,"旁边文字保留")] {
+        let input=eraseView.makeEditor(frame:NSRect(x:190,y:y,width:190,height:32))
+        input.string=text;eraseView.editor=input;eraseView.commit()
+    }
+    eraseView.drawingStore.begin(NSPoint(x:220,y:300),color:.blue)
+    eraseView.drawingStore.append(NSPoint(x:260,y:305),inside:true);eraseView.drawingStore.finish();eraseView.refreshDrawing()
+    eraseView.addSticker("02-rocket");eraseView.setPen(nil)
+    let originalLow=eraserPixels(eraseView.layers[0]), originalHigh=eraserPixels(eraseView.detailedLayers[0]!)
+    let neighbor=eraserPixels(eraseView.detailedLayers[1]!), artwork=eraserPixels(eraseView.displayedStickers), pen=eraserPixels(eraseView.displayedDrawing)
+    let eraseWindow=HandPanel(contentRect:eraseView.bounds,styleMask:[.borderless,.nonactivatingPanel],backing:.buffered,defer:false)
+    eraseWindow.contentView=eraseView
+    let eraseBounds=HandSurface.inkBounds(eraseView.layers[0])
+    let eraseStart=NSPoint(x:eraseBounds.minX-12,y:eraseBounds.midY), eraseEnd=NSPoint(x:eraseBounds.maxX+12,y:eraseBounds.midY)
+    func eraseGesture(_ type:NSEvent.EventType,_ point:NSPoint) {
+        let screen=eraseView.surface.display(eraseView.notePoint(point,note:eraseView.notes[0]))
+        let event=NSEvent.mouseEvent(with:type,location:eraseView.convert(screen,to:nil),modifierFlags:[],timestamp:0,windowNumber:eraseWindow.windowNumber,context:nil,eventNumber:1,clickCount:1,pressure:type == .leftMouseUp ? 0:1)!
+        switch type {
+        case .leftMouseDown:eraseView.mouseDown(with:event)
+        case .leftMouseDragged:eraseView.mouseDragged(with:event)
+        default:eraseView.mouseUp(with:event)
+        }
+    }
+    eraseGesture(.leftMouseDown,eraseStart)
+    eraseGesture(.leftMouseDragged,NSPoint(x:eraseBounds.midX,y:eraseBounds.midY))
+    eraseGesture(.leftMouseUp,eraseEnd)
+    precondition(eraseView.notes[0].done && eraserPixels(eraseView.layers[0]).allSatisfy { $0 == 0 } && eraserPixels(eraseView.detailedLayers[0]!).allSatisfy { $0 == 0 }, "Sweeping across the full word must complete it with zero residue, even when the pointer ends outside the word")
+    precondition(eraseView.smudgeHistory.count == 1 && eraseView.eraserPoint == nil, "One pointer gesture must create exactly one undo step and remove its cursor ring")
+    precondition(eraserPixels(eraseView.detailedLayers[1]!) == neighbor && eraserPixels(eraseView.displayedStickers) == artwork && eraserPixels(eraseView.displayedDrawing) == pen, "Precise erasing must preserve nearby text, stickers and freehand strokes")
+    let erasedReload=HandView(storage:eraseView.folder)
+    precondition(erasedReload.notes[0].done && eraserPixels(erasedReload.detailedLayers[0]!).allSatisfy { $0 == 0 }, "A fully erased word must remain clean and completed after restart")
+    eraseView.undoSmudge()
+    precondition(!eraseView.notes[0].done && eraserPixels(eraseView.layers[0]) == originalLow && eraserPixels(eraseView.detailedLayers[0]!) == originalHigh, "Undo must restore exact high resolution pigment and completion state")
+    try! SelfPreview.make(eraseView,scale:2).write(to:testOutput.appendingPathComponent("eraser-before-preview.png"))
+    let partialEnd=NSPoint(x:eraseBounds.midX,y:eraseBounds.midY)
+    eraseGesture(.leftMouseDown,eraseStart);eraseGesture(.leftMouseDragged,partialEnd);eraseGesture(.leftMouseUp,partialEnd)
+    precondition(!eraseView.notes[0].done && eraserPixels(eraseView.detailedLayers[0]!) != originalHigh, "Partial erasing must leave the remaining letters intact without prematurely completing the task")
+    try! SelfPreview.make(eraseView,scale:2).write(to:testOutput.appendingPathComponent("eraser-after-preview.png"))
+    // Freehand erasing has a separate tool and undo transaction, never a global mask.
+    let drawingEraseView=HandView(storage:temp.appendingPathComponent("drawing-eraser"))
+    let drawingEraseInput=drawingEraseView.makeEditor(frame:NSRect(x:190,y:200,width:190,height:32))
+    drawingEraseInput.string="文字保留";drawingEraseView.editor=drawingEraseInput;drawingEraseView.commit()
+    drawingEraseView.addSticker("02-rocket")
+    drawingEraseView.drawingStore.begin(NSPoint(x:210,y:280),color:.blue)
+    drawingEraseView.drawingStore.append(NSPoint(x:290,y:280),inside:true);drawingEraseView.drawingStore.finish();drawingEraseView.refreshDrawing()
+    let drawingOriginal=eraserPixels(drawingEraseView.drawingStore.bitmap())
+    let drawingText=eraserPixels(drawingEraseView.displayedInk), drawingSticker=eraserPixels(drawingEraseView.displayedStickers)
+    drawingEraseView.setPen(nil,erasing:true)
+    precondition(drawingEraseView.penMode && drawingEraseView.drawingEraserMode && !drawingEraseView.stickerMode, "Choosing the freehand eraser must switch to an isolated drawing tool")
+    let drawingEraseWindow=HandPanel(contentRect:drawingEraseView.bounds,styleMask:[.borderless,.nonactivatingPanel],backing:.buffered,defer:false)
+    drawingEraseWindow.contentView=drawingEraseView
+    func drawingEraseGesture(_ type:NSEvent.EventType,_ point:NSPoint) {
+        let screen=drawingEraseView.surface.display(point)
+        let event=NSEvent.mouseEvent(with:type,location:drawingEraseView.convert(screen,to:nil),modifierFlags:[],timestamp:0,windowNumber:drawingEraseWindow.windowNumber,context:nil,eventNumber:1,clickCount:1,pressure:type == .leftMouseUp ? 0:1)!
+        switch type {
+        case .leftMouseDown:drawingEraseView.mouseDown(with:event)
+        case .leftMouseDragged:drawingEraseView.mouseDragged(with:event)
+        default:drawingEraseView.mouseUp(with:event)
+        }
+    }
+    drawingEraseGesture(.leftMouseDown,NSPoint(x:250,y:268))
+    drawingEraseGesture(.leftMouseDragged,NSPoint(x:250,y:280))
+    let liveDrawing=eraserPixels(drawingEraseView.drawingStore.bitmap())
+    drawingEraseView.drawingStore.finish()
+    precondition(eraserPixels(drawingEraseView.drawingStore.bitmap()) == liveDrawing, "Incremental eraser preview must exactly match the saved vector replay")
+    // Ending the UI gesture must not add a second undo entry.
+    drawingEraseGesture(.leftMouseUp,NSPoint(x:250,y:280))
+    let drawingCut=drawingEraseView.drawingStore.bitmap()
+    precondition(drawingCut.bitmapData![560*drawingCut.bytesPerRow+500*4+3] == 0, "The freehand eraser must remove the touched part of a stroke completely")
+    precondition(drawingCut.bitmapData![560*drawingCut.bytesPerRow+440*4+3] > 0, "The rest of the same stroke must remain visible")
+    precondition(eraserPixels(drawingEraseView.displayedInk) == drawingText && eraserPixels(drawingEraseView.displayedStickers) == drawingSticker, "Freehand erasing must never modify text or stickers")
+    let drawingErasedReload=HandView(storage:drawingEraseView.folder)
+    precondition(eraserPixels(drawingErasedReload.displayedDrawing) == eraserPixels(drawingEraseView.displayedDrawing), "Erased freehand content must survive reopening exactly")
+    drawingEraseView.undoCurrent()
+    precondition(eraserPixels(drawingEraseView.drawingStore.bitmap()) == drawingOriginal && drawingEraseView.drawingStore.strokes.count == 1, "One undo must restore the entire freehand eraser gesture")
+    drawingEraseGesture(.leftMouseDown,NSPoint(x:250,y:268))
+    drawingEraseGesture(.leftMouseDragged,NSPoint(x:250,y:292))
+    drawingEraseGesture(.leftMouseUp,NSPoint(x:250,y:292))
+    try! SelfPreview.make(drawingEraseView,scale:2).write(to:testOutput.appendingPathComponent("drawing-eraser-preview.png"))
+    drawingEraseView.setPen(.red)
+    precondition(!drawingEraseView.drawingEraserMode && drawingEraseView.penMode, "Choosing a pen must exit freehand erasing")
+    drawingEraseView.drawingStore.begin(NSPoint(x:250,y:280),color:.red);drawingEraseView.drawingStore.finish();drawingEraseView.refreshDrawing()
+    let repaint=drawingEraseView.drawingStore.bitmap()
+    precondition(repaint.bitmapData![560*repaint.bytesPerRow+500*4+3] > 0, "New strokes must remain drawable over previously erased areas")
+    let emptyDrawing=DrawingStore(folder:temp.appendingPathComponent("empty-drawing-eraser"))
+    emptyDrawing.beginErasing(NSPoint(x:200,y:250));emptyDrawing.append(NSPoint(x:220,y:250),inside:true);emptyDrawing.finish()
+    precondition(emptyDrawing.strokes.isEmpty && !emptyDrawing.canUndo, "Erasing empty space must not create content or an undo entry")
     let view = HandView(storage: temp)
     let field = view.makeEditor(frame: NSRect(x: 190, y: 200, width: 190, height: 32))
     field.string = "下午交稿"; view.editor = field; view.commit()
@@ -764,6 +1093,7 @@ if CommandLine.arguments.contains("--self-test") {
     try! view.ink.representation(using: .png, properties: [:])!.write(to: testOutput.appendingPathComponent("ink-test.png"))
     let original = Data(bytes: view.ink.bitmapData!, count: view.ink.bytesPerRow*427)
     precondition(original.contains(where: { $0 != 0 }), "Text must draw visible pixels")
+    let originalDetail = Data(bytes:view.detailedLayers[0]!.bitmapData!,count:view.detailedLayers[0]!.bytesPerRow*854)
     let oldRect = view.notes[0].rect
     precondition(view.moveNote(0, dx: 12, dy: 10), "Text must move on skin")
     precondition(view.notes[0].x == oldRect.minX+12 && view.notes[0].y == oldRect.minY+10, "Hit bounds must follow text")
@@ -773,19 +1103,20 @@ if CommandLine.arguments.contains("--self-test") {
     precondition(movedReload.notes[0].rect == view.notes[0].rect, "Position must persist")
     precondition(view.moveNote(0, dx: -12, dy: -10), "Text must move back")
     precondition(Data(bytes: view.ink.bitmapData!, count: view.ink.bytesPerRow*427) == original, "Moving must preserve ink exactly")
+    precondition(Data(bytes:view.detailedLayers[0]!.bitmapData!,count:view.detailedLayers[0]!.bytesPerRow*854) == originalDetail, "Moving must preserve high resolution glyphs exactly")
     for _ in 0..<4 {
         for x in stride(from: 190.0, to: 290.0, by: 3) { view.smudge(NSPoint(x: x, y: 215), dx: 3, dy: 0) }
         for x in stride(from: 290.0, to: 190.0, by: -3) { view.smudge(NSPoint(x: x, y: 215), dx: -3, dy: 0) }
     }
     let smeared = Data(bytes: view.ink.bitmapData!, count: view.ink.bytesPerRow*427)
-    precondition(original != smeared, "Smudge must move pigment")
+    precondition(original != smeared, "Erasing must remove pigment")
     try! view.ink.representation(using: .png, properties: [:])!.write(to: testOutput.appendingPathComponent("smudge-test.png"))
     view.layers[0] = view.ink
     view.notes[0].done = true; view.save()
     let restored = HandView(storage: temp)
     precondition(restored.notes.count == 1 && restored.notes[0].done, "Completion must persist")
     let restoredData = Data(bytes: restored.ink.bitmapData!, count: restored.ink.bytesPerRow*427)
-    precondition(restoredData.contains(where: { $0 != 0 }), "Ink residue must persist")
+    precondition(restoredData.contains(where: { $0 != 0 }), "Existing partial ink must persist")
     let preview = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 640, pixelsHigh: 427, bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 2560, bitsPerPixel: 32)!
     view.cacheDisplay(in: view.bounds, to: preview)
     try! preview.representation(using: .png, properties: [:])!.write(to: testOutput.appendingPathComponent("preview.png"))
@@ -808,17 +1139,83 @@ if CommandLine.arguments.contains("--self-test") {
     let legacyReload = HandView(storage:legacyFolder)
     precondition(legacyReload.notes[0].width == legacy.notes[0].width, "Restart must not shrink notes again")
     precondition(legacy.layers.count == 1 && legacy.moveNote(0, dx: 5, dy: 0), "Older saved notes must remain movable")
+    // Exercise the actual NSTextInputClient marked-text path at the palm and finger edges.
+    for (name,frame) in [("palm-edge",NSRect(x:190,y:360,width:60,height:32)),("thumb-edge",NSRect(x:250,y:110,width:65,height:32))] {
+        let overflow = HandView(storage:temp.appendingPathComponent(name))
+        let input = overflow.makeEditor(frame:frame) as! SurfaceTextView
+        overflow.editor=input
+        let sentence=String(repeating:"边界中文输入自动换行",count:18)
+        input.insertText(sentence,replacementRange:NSRange(location:0,length:0))
+        let end=(input.string as NSString).length
+        input.setSelectedRange(NSRange(location:end,length:0))
+        input.setMarkedText("zhongwen",selectedRange:NSRange(location:8,length:0),replacementRange:NSRange(location:NSNotFound,length:0))
+        precondition(input.hasMarkedText(),"Composition must remain active beyond the palm boundary")
+        precondition(!overflow.textView(input,doCommandBy:#selector(NSResponder.insertNewline(_:))),"Return during composition must remain available to the input method")
+        input.insertText("中文",replacementRange:input.markedRange())
+        precondition(input.string == sentence+"中文" && !input.hasMarkedText(),"Committed Chinese must replace pinyin even when the note exceeds the hand")
+        overflow.textDidChange(Notification(name:NSText.didChangeNotification))
+        precondition(input.frame.maxY > overflow.bounds.maxY,"Long text must grow beyond the hand rather than rejecting input")
+        let layout=input.layoutManager!;layout.ensureLayout(for:input.textContainer!)
+        precondition(layout.usedRect(for:input.textContainer!).height > 427,"Long text must wrap into additional lines")
+        overflow.commit()
+        let originalSource=eraserPixels(overflow.sourceLayers[0]!), originalDetail=eraserPixels(overflow.sourceDetailedLayers[0]!)
+        precondition(overflow.sourceLayers[0]!.size.height > 427,"Source must retain all off-canvas lines")
+        if name == "palm-edge" {
+            try! SelfPreview.make(overflow,scale:2).write(to:testOutput.appendingPathComponent("overflow-before-preview.png"))
+            let original=eraserPixels(overflow.layers[0]), originalProjected=eraserPixels(overflow.detailedLayers[0]!)
+            let delta=Int((300-overflow.sourceOrigin(overflow.notes[0]).y-overflow.sourceLayers[0]!.size.height).rounded())
+            precondition(overflow.moveNote(0,dx:0,dy:delta),"An overflowing note must move even while many lines remain outside the hand")
+            let tail=overflow.layers[0]
+            precondition((260..<300).contains{y in (190..<250).contains{x in tail.bitmapData![y*tail.bytesPerRow+x*4+3]>0}},"Dragging must reveal the off-canvas final lines")
+            try! SelfPreview.make(overflow,scale:2).write(to:testOutput.appendingPathComponent("overflow-after-preview.png"))
+            overflow.save()
+            let reload=HandView(storage:overflow.folder)
+            precondition(eraserPixels(reload.sourceLayers[0]!) == originalSource && eraserPixels(reload.sourceDetailedLayers[0]!) == originalDetail,"All overflow ink must survive restart exactly")
+            precondition(reload.moveNote(0,dx:0,dy:-delta),"Hidden first lines must remain recoverable after restart")
+            precondition(eraserPixels(reload.layers[0]) == original && eraserPixels(reload.detailedLayers[0]!) == originalProjected,"Off-canvas round-trip must preserve every original pixel")
+            reload.active=0;reload.beginSmudge(0);reload.ink=reload.layers[0]
+            _=reload.smudge(NSPoint(x:205,y:370),dx:10,dy:0);reload.layers[0]=reload.ink;reload.finishSmudge();reload.active=nil
+            precondition(eraserPixels(reload.sourceLayers[0]!) != originalSource,"Erasing must update the retained source too")
+            let erased=eraserPixels(reload.layers[0])
+            precondition(reload.moveNote(0,dx:0,dy:delta) && reload.moveNote(0,dx:0,dy:-delta),"Partly erased overflow text must remain movable")
+            precondition(eraserPixels(reload.layers[0]) == erased,"Dragging must not resurrect erased ink")
+            reload.active=0;reload.beginSmudge(0);reload.ink=reload.layers[0]
+            _=reload.smudge(NSPoint(x:230,y:370),dx:10,dy:0);reload.layers[0]=reload.ink;reload.finishSmudge();reload.active=nil
+            let beforeUndo=eraserPixels(reload.sourceLayers[0]!)
+            reload.undoSmudge()
+            precondition(eraserPixels(reload.sourceLayers[0]!) != beforeUndo && eraserPixels(reload.layers[0]) == erased,"Undo must restore retained source and visible ink together")
+            let recoveredSource=eraserPixels(reload.sourceLayers[0]!), recoveredDetail=eraserPixels(reload.sourceDetailedLayers[0]!)
+            precondition(reload.washHand(),"Wash must also remove retained overflow sources")
+            precondition(reload.sourceLayers.isEmpty && reload.sourceDetailedLayers.isEmpty,"Wash must clear all retained source caches")
+            reload.undoWash()
+            precondition(eraserPixels(reload.sourceLayers[0]!) == recoveredSource && eraserPixels(reload.sourceDetailedLayers[0]!) == recoveredDetail,"Wash recovery must restore the exact overflow sources")
+        }
+    }
+    print("PASS: Chinese composition at palm and thumb boundaries, automatic wrapping, off-canvas source retention, drag recovery, exact restart and movement, retained-source erasure and undo, wash recovery")
     let multiline = HandView(storage: temp.appendingPathComponent("multiline"))
     let multilineEditor = multiline.makeEditor(frame: NSRect(x: 190, y: 160, width: 100, height: 32))
     precondition(!multilineEditor.drawsBackground && multilineEditor.textContainerInset.width == 0, "Editor must have no background or inset")
-    precondition(multiline.handwriting(16).fontName == "HannotateSC-W5", "Use installed handwriting font")
+    precondition(multiline.handwriting(HandView.defaultFontSize).fontName == "HannotateSC-W5", "Use installed handwriting font")
     multilineEditor.string = "下午交稿然后去拿快递\n记得回复消息"
     multiline.editor = multilineEditor
     multiline.textDidChange(Notification(name: NSText.didChangeNotification))
     precondition(multilineEditor.frame.height > 40, "Editor must grow for wrapped lines")
     multiline.addSubview(multilineEditor)
+    let crispEditor = multilineEditor as! SurfaceTextView
+    let retinaText = crispEditor.textBitmap(scale: 2)
+    precondition(retinaText.pixelsWide == 1280 && retinaText.pixelsHigh == 854 && retinaText.size == multiline.bounds.size, "Retina text must retain point geometry at double pixel density")
+    let retinaWarp = multiline.surface.warpDetailed(retinaText, anchor: crispEditor.anchor, angle: crispEditor.angle)
+    precondition((320..<420).contains { y in (380..<580).contains { x in retinaWarp.bitmapData![y*retinaWarp.bytesPerRow+x*4+3] > 0 } }, "High resolution glyphs must remain at their hand coordinates")
+    try! retinaWarp.representation(using: .png, properties: [:])!.write(to: testOutput.appendingPathComponent("retina-text-preview.png"))
+    let standardText = crispEditor.textBitmap(scale: 1)
+    let singlePass = multiline.surface.warpDetailed(standardText, anchor: crispEditor.anchor, angle: 0)
+    let originalWarp = multiline.surface.warp(standardText)
+    precondition(Data(bytes: singlePass.bitmapData!, count: singlePass.bytesPerRow*427) == Data(bytes: originalWarp.bitmapData!, count: originalWarp.bytesPerRow*427), "Combined transform must preserve the original unrotated coordinates")
     try! SelfPreview.make(multiline).write(to: testOutput.appendingPathComponent("live-surface-preview.png"))
+    let expectedSavedText = multiline.surface.warpDetailed(crispEditor.textBitmap(scale: 2, editing: false), anchor: crispEditor.anchor, angle: crispEditor.angle)
+    let expectedSavedPixels = Data(bytes: expectedSavedText.bitmapData!, count: expectedSavedText.bytesPerRow*expectedSavedText.pixelsHigh)
     multiline.commit()
+    precondition(multiline.displayedInk.pixelsWide == 1280 && Data(bytes: multiline.displayedInk.bitmapData!, count: multiline.displayedInk.bytesPerRow*multiline.displayedInk.pixelsHigh) == expectedSavedPixels, "Saving must preserve every preview glyph pixel without the editing caret")
     precondition(multiline.notes[0].height > 40, "Committed bounds must include every line")
     let bitmap = multiline.layers[0]
     let lowerInk = (185..<min(427, Int(multiline.notes[0].rect.maxY))).contains { y in
@@ -828,6 +1225,7 @@ if CommandLine.arguments.contains("--self-test") {
     let multiPreview = SelfPreview.make(multiline)
     try! multiPreview.write(to: testOutput.appendingPathComponent("multiline-preview.png"))
     let multiReload = HandView(storage: multiline.folder)
+    precondition(Data(bytes: multiReload.displayedInk.bitmapData!, count: multiReload.displayedInk.bytesPerRow*multiReload.displayedInk.pixelsHigh) == expectedSavedPixels, "Restart must restore the complete high resolution text exactly")
     precondition(multiReload.notes[0].height == multiline.notes[0].height, "Multiline bounds must persist")
     let undoView = HandView(storage: temp.appendingPathComponent("undo"))
     let undoEditor = undoView.makeEditor(frame: NSRect(x: 190, y: 200, width: 190, height: 32))
@@ -835,6 +1233,7 @@ if CommandLine.arguments.contains("--self-test") {
     let untouchedInk = Data(bytes: undoView.layers[0].bitmapData!, count: undoView.layers[0].bytesPerRow*427)
     undoView.beginSmudge(0); undoView.finishSmudge()
     precondition(undoView.smudgeHistory.isEmpty, "Clicking must not create an undo step")
+    let untouchedDetail = Data(bytes:undoView.detailedLayers[0]!.bitmapData!,count:undoView.detailedLayers[0]!.bytesPerRow*854)
     for _ in 0..<2 {
         undoView.beginSmudge(0); undoView.ink = undoView.layers[0]
         undoView.smudge(NSPoint(x: 220, y: 215), dx: 8, dy: 0)
@@ -843,7 +1242,9 @@ if CommandLine.arguments.contains("--self-test") {
         undoView.notes[0].done = true; undoView.finishSmudge()
     }
     precondition(undoView.smudgeHistory.count == 2, "Each stroke must create one step")
+    precondition(Data(bytes:undoView.detailedLayers[0]!.bitmapData!,count:undoView.detailedLayers[0]!.bytesPerRow*854) != untouchedDetail, "Rubbing must change high resolution ink too")
     undoView.undoSmudge(); undoView.undoSmudge()
+    precondition(Data(bytes:undoView.detailedLayers[0]!.bitmapData!,count:undoView.detailedLayers[0]!.bytesPerRow*854) == untouchedDetail, "Undo must restore high resolution ink exactly")
     precondition(!undoView.notes[0].done && undoView.notes[0].distance == 0 && undoView.notes[0].reversals == 0, "Undo must restore task and rubbing progress")
     precondition(Data(bytes: undoView.layers[0].bitmapData!, count: undoView.layers[0].bytesPerRow*427) == untouchedInk, "Undo must restore exact pigment")
     let undoReload = HandView(storage: undoView.folder)
@@ -862,8 +1263,24 @@ if CommandLine.arguments.contains("--self-test") {
         let input = fingers.makeEditor(frame: NSRect(origin: origin, size: NSSize(width: width,height: 32)))
         input.string = text; fingers.editor = input; fingers.commit()
     }
+    for i in fingers.notes.indices {
+        let detail = fingers.detailedLayers[i]!, anchor = fingers.noteAnchor(fingers.notes[i])
+        let angle = fingers.surface.writingAngle(at:anchor)
+        let full = fingers.surface.warpDetailed(detail,anchor:anchor,angle:angle,clipped:false)
+        let clipped = fingers.surface.warpDetailed(detail,anchor:anchor,angle:angle)
+        precondition(Data(bytes:full.bitmapData!,count:full.bytesPerRow*full.pixelsHigh) == Data(bytes:clipped.bitmapData!,count:clipped.bytesPerRow*clipped.pixelsHigh), "Partial rendering must match the complete transform at every writing angle")
+    }
+    let cachedBefore = Data(bytes:fingers.displayedInk.bitmapData!,count:fingers.displayedInk.bytesPerRow*fingers.displayedInk.pixelsHigh)
+    fingers.rebuildInk(changedIndex:0)
+    precondition(Data(bytes:fingers.displayedInk.bitmapData!,count:fingers.displayedInk.bytesPerRow*fingers.displayedInk.pixelsHigh) == cachedBefore, "Reusing other note projections must preserve overlap and composition exactly")
+
     precondition(fingers.surface.writingAngle(at: NSPoint(x:250,y:125)) < -0.8, "Thumb writing must follow its diagonal axis")
     precondition(abs(fingers.surface.writingAngle(at: NSPoint(x:400,y:174))-atan2(-47.0,185.0)) < 0.01, "Index writing follows the finger axis")
+    precondition(fingers.moveNote(3,dx:1,dy:0), "A cached note must remain movable")
+    let movedCached = Data(bytes:fingers.displayedInk.bitmapData!,count:fingers.displayedInk.bytesPerRow*fingers.displayedInk.pixelsHigh)
+    fingers.rebuildInk()
+    precondition(Data(bytes:fingers.displayedInk.bitmapData!,count:fingers.displayedInk.bytesPerRow*fingers.displayedInk.pixelsHigh) == movedCached, "An incremental move must match a complete rebuild with multiple notes")
+    precondition(fingers.moveNote(3,dx:-1,dy:0), "Returning a cached note must preserve its coordinates")
     let thumb = fingers.notes[0]
     let point = NSPoint(x: thumb.x+40,y:thumb.y+12)
     let projected = fingers.surface.display(fingers.notePoint(point,note:thumb))
@@ -958,6 +1375,19 @@ if CommandLine.arguments.contains("--self-test") {
     try! SelfPreview.make(switchView).write(to:testOutput.appendingPathComponent("drawing-preview.png"))
     switchView.save()
     let drawingReload=HandView(storage:switchView.folder)
+    func allPixels(_ bitmap: NSBitmapImageRep) -> Data {
+        Data(bytes:bitmap.bitmapData!,count:bitmap.bytesPerRow*bitmap.pixelsHigh)
+    }
+    precondition(switchView.displayedDrawing.pixelsWide == 1280 && switchView.displayedDrawing.pixelsHigh == 854, "Freehand strokes must retain Retina resolution through surface deformation")
+    precondition(allPixels(drawingReload.displayedDrawing) == allPixels(switchView.displayedDrawing), "Saved vector strokes must restore every high resolution pixel")
+    let lowDrawing = switchView.drawingStore.bitmap(scale: 1)
+    let enlargedDrawing = HandView.blank(scale: 2)
+    NSGraphicsContext.saveGraphicsState()
+    NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep:enlargedDrawing)
+    lowDrawing.draw(in:switchView.bounds)
+    NSGraphicsContext.restoreGraphicsState()
+    precondition(allPixels(switchView.drawingStore.bitmap()) != allPixels(enlargedDrawing), "High resolution strokes must be drawn from paths rather than enlarged from low resolution pixels")
+    try! SelfPreview.make(switchView,scale:2).write(to:testOutput.appendingPathComponent("retina-drawing-preview.png"))
     precondition(drawingReload.drawingStore.strokes.count == 3 && drawingReload.notes.count == textCount, "Drawings and notes must restore separately")
     switchView.drawingStore.clear(); switchView.refreshDrawing()
     precondition(switchView.drawingStore.strokes.isEmpty && switchView.notes.count == textCount, "Clearing drawings must preserve notes")
@@ -995,6 +1425,14 @@ if CommandLine.arguments.contains("--self-test") {
     precondition(!stickerView.stickerStore.transform(dx:1000,valid:{stickerView.onSkin(stickerView.surface.display($0))}), "Reject moving element off hand")
     stickerView.refreshStickers();stickerView.save()
     let stickerReload=HandView(storage:stickerFolder)
+    precondition(stickerView.displayedStickers.pixelsWide == 1280 && stickerView.displayedStickers.pixelsHigh == 854, "Scaled rotated artwork must retain Retina resolution through surface deformation")
+    precondition(allPixels(stickerReload.displayedStickers) == allPixels(stickerView.displayedStickers), "Reopening must render transformed artwork from original assets without losing pixels")
+    precondition(allPixels(stickerView.displayedStickers).contains { $0 != 0 }, "High resolution transformed artwork must remain visible")
+    for (asset,_) in StickerStore.catalog {
+        let source = stickerView.stickerStore.bitmaps[asset]!
+        precondition(source.pixelsWide >= 600, "Original artwork must cover the maximum 300 point size at Retina density")
+    }
+    try! SelfPreview.make(stickerView,scale:2).write(to:testOutput.appendingPathComponent("retina-sticker-preview.png"))
     precondition(stickerReload.stickerStore.items==stickerView.stickerStore.items, "Transform values must survive reopening")
     precondition(stickerReload.notes.count==1 && stickerReload.drawingStore.strokes.isEmpty, "Sticker persistence must stay separate")
     precondition(Data(bytes:stickerView.ink.bitmapData!,count:stickerView.ink.bytesPerRow*427)==noteInkBefore, "Manipulating stickers must preserve text ink")
@@ -1048,7 +1486,7 @@ if CommandLine.arguments.contains("--self-test") {
     precondition(cleanView.washHand(),"Wash must clear all content kinds")
     precondition(!cleanView.hasHandContent && cleanView.notes.isEmpty && cleanView.layers.isEmpty,"Wash removes task records and all text layers")
     for bitmap in [cleanView.ink,cleanView.displayedInk,cleanView.displayedDrawing,cleanView.displayedStickers] {
-        let bytes=Data(bytes:bitmap.bitmapData!,count:bitmap.bytesPerRow*427)
+        let bytes=Data(bytes:bitmap.bitmapData!,count:bitmap.bytesPerRow*bitmap.pixelsHigh)
         precondition(bytes.allSatisfy{$0==0},"Wash must leave absolutely no pigment or smudge residue")
     }
     precondition(!cleanView.drawingStore.canUndo && !cleanView.stickerStore.canUndo && cleanView.smudgeHistory.isEmpty,"Old histories cannot resurrect individual remnants")
@@ -1059,7 +1497,7 @@ if CommandLine.arguments.contains("--self-test") {
     precondition(!cleanReload.canUndoWash,"Wash recovery must be consumed after restoration")
     precondition(cleanReload.washHand(),"Hand can be washed again")
     precondition(!cleanReload.washHand(),"Washing a clean hand cannot overwrite recovery")
-    print("PASS: wash all layers and zero residue, persistent wash and recovery, element drag gesture and grouped undo, element move scale rotation, element hit testing persistence isolation and undo, repeat wrist activation after mode changes, wrist tool hit testing, three pen colors, drawing isolation, drawing persistence and undo, click vs long press and rubbing, short-line caret, first-click focus, single-click input switching, click-create typing-focus and return-save, finger direction, rotated hit testing and persistence, height-map deformation, inverse hit testing, multi-step smudge undo, completion restoration, undo persistence, handwriting, transparent editor, multiline growth and rendering, edge retrigger prevention, hover stability, immediate exit, overlap isolation, legacy migration, move, bounds, position persistence, ink preservation, input, pigment displacement, persistent completion, ink residue restoration")
+    print("PASS: freehand eraser partial removal, live replay equality, isolation, persistence, grouped undo, repaint and empty gesture handling, precise clean continuous erasing, no pigment spreading, gesture completion persistence isolation and exact undo, partial rendering matches full rendering and cached composition, high resolution vector drawing and artwork persistence, high resolution save and restart pixel equality, high resolution movement and smudge undo, wash all layers and zero residue, persistent wash and recovery, element drag gesture and grouped undo, element move scale rotation, element hit testing persistence isolation and undo, repeat wrist activation after mode changes, wrist tool hit testing, three pen colors, drawing isolation, drawing persistence and undo, click vs long press and rubbing, short-line caret, first-click focus, single-click input switching, click-create typing-focus and return-save, finger direction, rotated hit testing and persistence, height-map deformation, inverse hit testing, multi-step smudge undo, completion restoration, undo persistence, handwriting, transparent editor, multiline growth and rendering, edge retrigger prevention, hover stability, immediate exit, overlap isolation, legacy migration, move, bounds, position persistence, ink preservation, input, pigment displacement, persistent completion, ink residue restoration")
     try? FileManager.default.removeItem(at: temp)
     exit(0)
 }
