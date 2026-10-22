@@ -4,12 +4,15 @@
     <UseWPF>true</UseWPF><UseWindowsForms>true</UseWindowsForms><EnableWindowsTargeting>true</EnableWindowsTargeting>
     <ImplicitUsings>disable</ImplicitUsings><Nullable>enable</Nullable>
     <AssemblyName>HandTodo</AssemblyName><Version>$([System.IO.File]::ReadAllText('$(MSBuildProjectDirectory)/../VERSION').Trim())</Version>
+    <ApplicationIcon>../Resources/Brand/AppIcon-hi-v2/HandTodo.ico</ApplicationIcon>
     <PublishSingleFile>true</PublishSingleFile><SelfContained>true</SelfContained><IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
     <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile><DebugType>none</DebugType><PublishTrimmed>false</PublishTrimmed>
   </PropertyGroup>
   <ItemGroup>
     <EmbeddedResource Include="../Resources/hand.png" LogicalName="hand.png" />
     <EmbeddedResource Include="../Resources/hand-height.png" LogicalName="hand-height.png" />
+    <EmbeddedResource Include="../Resources/Brand/AppIcon-hi-v2/HandTodo.ico" LogicalName="HandTodo.ico" />
+    <EmbeddedResource Include="../Resources/Brand/AppIcon-hi-v2/windows/HandTodo-256.png" LogicalName="app-icon.png" />
     <EmbeddedResource Include="../Resources/Doodles/*.png" LogicalName="%(Filename)%(Extension)" />
   </ItemGroup>
 </Project>

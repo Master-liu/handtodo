@@ -6,12 +6,12 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import platform
 import plistlib
 import re
 import shutil
 import subprocess
 import sys
+import struct
 import time
 import urllib.error
 import urllib.parse
@@ -23,6 +23,7 @@ from contextlib import contextmanager
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = "windows-package.yml"
 CATALOG = ["01-cat", "02-rocket", "03-ufo", "04-boat", "05-coffee"]
+BRAND = Path("Brand/AppIcon-hi-v2")
 
 class PackageError(Exception):
     pass
@@ -38,6 +39,82 @@ def digest(path):
         for block in iter(lambda: f.read(1024 * 1024), b""):
             h.update(block)
     return h.hexdigest()
+
+def verify_macos_icon(app, expected):
+    with (app / "Contents/Info.plist").open("rb") as f:
+        info = plistlib.load(f)
+    if info.get("CFBundleIconFile") not in {"HandTodo", "HandTodo.icns"}:
+        raise PackageError("Mac 应用未配置 hi 手掌图标")
+    icon = app / "Contents/Resources/HandTodo.icns"
+    if not icon.is_file() or digest(icon) != digest(expected):
+        raise PackageError("Mac 应用内图标缺失或与确认的 Logo 不一致")
+    return {"status": "passed", "file": icon.name, "sha256": digest(icon)}
+
+def pe_resources(data, resource_type):
+    """Read native PE resources, excluding lookalike bytes in managed resources."""
+    try:
+        pe = struct.unpack_from("<I", data, 0x3c)[0]
+        if data[:2] != b"MZ" or data[pe:pe+4] != b"PE\0\0":
+            raise ValueError("Not a PE executable")
+        sections, optional_size = struct.unpack_from("<H", data, pe+6)[0], struct.unpack_from("<H", data, pe+20)[0]
+        optional = pe+24
+        magic = struct.unpack_from("<H", data, optional)[0]
+        if magic not in {0x10b, 0x20b}:
+            raise ValueError("Unsupported PE optional header")
+        directory = optional+(112 if magic == 0x20b else 96)+16
+        resource_rva = struct.unpack_from("<I", data, directory)[0]
+        def offset(rva, size=1):
+            for i in range(sections):
+                section = optional+optional_size+i*40
+                _, start, raw_size, raw = struct.unpack_from("<IIII", data, section+8)
+                if start <= rva and rva+size <= start+raw_size and raw+rva-start+size <= len(data):
+                    return raw+rva-start
+            raise ValueError("Resource address outside section")
+        base = offset(resource_rva)
+        def entries(relative):
+            directory_offset = base+relative
+            named, ids = struct.unpack_from("<HH", data, directory_offset+12)
+            if directory_offset+16+(named+ids)*8 > len(data):
+                raise ValueError("Truncated resource directory")
+            return [struct.unpack_from("<II", data, directory_offset+16+i*8) for i in range(named+ids)]
+        result = {}
+        for kind, type_dir in entries(0):
+            if kind != resource_type or not type_dir & 0x80000000:
+                continue
+            for name, name_dir in entries(type_dir & 0x7fffffff):
+                if not name_dir & 0x80000000:
+                    continue
+                for _, leaf in entries(name_dir & 0x7fffffff):
+                    if leaf & 0x80000000:
+                        continue
+                    rva, size = struct.unpack_from("<II", data, base+leaf)
+                    start = offset(rva, size)
+                    result.setdefault(name, []).append(data[start:start+size])
+        return result
+    except (ValueError, struct.error, IndexError) as e:
+        raise PackageError("Windows 程序原生图标资源无效：" + str(e)) from None
+
+def verify_windows_icon(exe, expected):
+    ico, data = expected.read_bytes(), exe.read_bytes()
+    reserved, kind, count = struct.unpack_from("<HHH", ico)
+    if (reserved, kind) != (0, 1) or not count:
+        raise PackageError("确认的 Windows 图标不是有效 ICO")
+    icons, groups = pe_resources(data, 3), pe_resources(data, 14)
+    for group in (g for values in groups.values() for g in values):
+        if group[:6] != ico[:6] or len(group) < 6+14*count:
+            continue
+        sizes, valid = [], True
+        for i in range(count):
+            entry, expected_entry = group[6+14*i:20+14*i], ico[6+16*i:22+16*i]
+            length, start = struct.unpack_from("<II", expected_entry, 8)
+            resource_id = struct.unpack_from("<H", entry, 12)[0]
+            if entry[:12] != expected_entry[:12] or ico[start:start+length] not in icons.get(resource_id, []):
+                valid = False
+                break
+            sizes.append(expected_entry[0] or 256)
+        if valid:
+            return {"status": "passed", "format": "embedded-PE-icon", "sizes": sizes, "source_sha256": digest(expected)}
+    raise PackageError("Windows EXE 未嵌入确认的 hi 手掌图标或缺少尺寸")
 
 def git(*args, required=True):
     p = subprocess.run(["git", "-C", str(ROOT), *args], capture_output=True, text=True)
@@ -257,6 +334,14 @@ class Pipeline:
         for name in ["hand.png", "hand-height.png", *("Doodles/" + n + ".png" for n in CATALOG)]:
             if not (ROOT / "Resources" / name).is_file():
                 raise PackageError("缺少素材：" + name)
+        icons = []
+        if "macos" in self.platforms:
+            icons.append(BRAND / "HandTodo.icns")
+        if "windows" in self.platforms:
+            icons += [BRAND / "HandTodo.ico", BRAND / "windows/HandTodo-256.png"]
+        for name in icons:
+            if not (ROOT / "Resources" / name).is_file():
+                raise PackageError("缺少应用图标：" + str(name))
         if "windows" in self.platforms:
             sdk = subprocess.run(["dotnet", "--list-sdks"], capture_output=True, text=True, check=True).stdout
             if not re.search(r"(?m)^8\.", sdk):
@@ -279,7 +364,7 @@ class Pipeline:
                                             "sha256": digest(path)})
 
     def macos(self):
-        print("Mac：构建 Apple 芯片 + Intel 通用版", flush=True)
+        print("Mac：构建 Apple 芯片版（arm64，含 hi 手掌图标）", flush=True)
         self.run([ROOT / "build.sh"], "macos-build", {**os.environ, "HANDTODO_VERSION": self.version})
         app = ROOT / "build/掌上待办.app"
         exe = app / "Contents/MacOS/HandTodo"
@@ -287,27 +372,23 @@ class Pipeline:
             if plistlib.load(f)["CFBundleShortVersionString"] != self.version:
                 raise PackageError("Mac 应用内部版本与打包版本不一致")
         architectures = self.run(["lipo", "-archs", exe], "macos-architectures").split()
-        if set(architectures) != {"arm64", "x86_64"}:
-            raise PackageError("Mac 可执行文件不是双架构通用版")
+        if architectures != ["arm64"]:
+            raise PackageError("Mac 可执行文件必须仅包含 Apple 芯片 arm64 架构")
+        icon = verify_macos_icon(app, ROOT / "Resources" / BRAND / "HandTodo.icns")
         self.run(["codesign", "--verify", "--deep", "--strict", app], "macos-signature")
         self.run([exe, "--self-test"], "macos-native-tests")
-        tests = {"native": "passed", "other_architecture": "not-executed"}
-        if platform.machine() == "arm64":
-            probe = subprocess.run(["arch", "-x86_64", "/usr/bin/true"], capture_output=True)
-            if probe.returncode == 0:
-                self.run(["arch", "-x86_64", exe, "--self-test"], "macos-intel-tests")
-                tests["other_architecture"] = "passed-under-Rosetta"
+        tests = {"native": "passed"}
         stage = self.work / "macos-stage"
         stage.mkdir(parents=True)
         self.run(["ditto", app, stage / app.name], "macos-stage")
         (stage / "Applications").symlink_to("/Applications")
         instructions = (ROOT / "Distribution/使用说明-Mac.txt").read_text().replace("{{VERSION}}", self.version)
         (stage / "使用说明.txt").write_text(instructions)
-        dmg = self.output / ("HandTodo-%s-macOS-Universal.dmg" % self.version)
+        dmg = self.output / ("HandTodo-%s-macOS-AppleSilicon.dmg" % self.version)
         self.run(["hdiutil", "create", "-volname", "掌上待办", "-srcfolder", stage, "-format", "UDZO", dmg], "macos-dmg")
         self.run(["hdiutil", "verify", dmg], "macos-dmg-integrity")
         self.manifest["verification"]["macos"] = {"status": "passed", "architectures": architectures, "tests": tests,
-                                                    "disk_image": "verified", "code_signature": "ad-hoc-verified"}
+                                                    "disk_image": "verified", "code_signature": "ad-hoc-verified", "icon": icon}
         self.add_artifact("macos", dmg)
 
     def windows(self):
@@ -318,6 +399,7 @@ class Pipeline:
         exe = publish / "HandTodo.exe"
         if exe.read_bytes()[:2] != b"MZ":
             raise PackageError("Windows 可执行文件格式错误")
+        icon = verify_windows_icon(exe, ROOT / "Resources" / BRAND / "HandTodo.ico")
         method = self.args.windows_test
         if method == "auto":
             method = "local" if os.name == "nt" else "github"
@@ -335,6 +417,7 @@ class Pipeline:
         else:
             verification = {"status": "not-run", "method": "explicit-skip", "limitation": "Cross-built; no Windows runtime verification"}
         self.manifest["verification"]["windows"] = verification
+        verification["icon"] = icon
         target = self.output / ("HandTodo-%s-Windows-x64.zip" % self.version)
         top = "HandTodo-%s-Windows-x64" % self.version
         instructions = (ROOT / "Distribution/使用说明-Windows.txt").read_text().replace("{{VERSION}}", self.version)

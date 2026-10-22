@@ -35,7 +35,7 @@ public static class Program {
    var window=new HandWindow(test?temporary:null);
    if(test)window.Loaded+=(s,e)=>window.Dispatcher.BeginInvoke(new Action(()=>{
     Directory.CreateDirectory(output);
-    try{window.SelfTest(output);File.WriteAllText(Path.Combine(output,"result.txt"),"PASS: native window startup, embedded assets, text, smudge undo, drawing, sticker transforms, persistence, height mapping, wash and zero residue");window.Close();}
+    try{window.SelfTest(output);File.WriteAllText(Path.Combine(output,"result.txt"),"PASS: native window startup, application and tray icons, embedded assets, text, smudge undo, drawing, sticker transforms, persistence, height mapping, wash and zero residue");window.Close();}
     catch(Exception failure){File.WriteAllText(Path.Combine(output,"result.txt"),failure.ToString());Environment.ExitCode=1;window.Close();}
    }));
    app.Run(window);
@@ -47,6 +47,7 @@ public sealed class HandWindow:Window {
  const int W=640,H=427; readonly Canvas canvas=new(){Width=W,Height=H,Background=Brushes.Transparent,Focusable=true};
  readonly WpfImage handImage=new(){Width=W,Height=H,IsHitTestVisible=false},inkImage=new(){Width=W,Height=H,IsHitTestVisible=false};
  readonly Forms.NotifyIcon tray; readonly DispatcherTimer timer; readonly string folder; readonly byte[] skin=new byte[W*H];readonly double[] heights=new double[W*H];readonly double[] sourceX=new double[W*H],sourceY=new double[W*H];
+ readonly System.Drawing.Icon applicationIcon;
  readonly Dictionary<string,BitmapSource> assets=[];readonly List<byte[]> history=[];HandState state=new();TextBox? editor;Point editorAnchor;
  enum Tool{Todo,Pen,Sticker} Tool tool; string pen="#202020";int selected=-1;Point? down,last;long downTime;bool moved,held,recorded,edge,menuOpen;int active=-1,direction; bool altMove;
  readonly Typeface handwriting=new(new FontFamily("KaiTi, Segoe Print, Microsoft YaHei UI"),FontStyles.Normal,FontWeights.Normal,FontStretches.Normal);
@@ -60,6 +61,10 @@ public sealed class HandWindow:Window {
   folder=dataFolder??Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),"HandTodo");Directory.CreateDirectory(folder);
   try{if(File.Exists(DataFile))state=Decode(File.ReadAllBytes(DataFile));}catch{File.Copy(DataFile,Path.Combine(folder,"state-recovery-"+DateTime.Now.ToString("yyyyMMddHHmmss")+".gz"),true);}
   Width=W;Height=H;WindowStyle=WindowStyle.None;AllowsTransparency=true;Background=Brushes.Transparent;ShowInTaskbar=false;Topmost=true;ResizeMode=ResizeMode.NoResize;Title="掌上待办";Content=canvas;
+  Icon=Resource("app-icon.png");
+  using(var stream=Assembly.GetExecutingAssembly().GetManifestResourceStream("HandTodo.ico")??throw new FileNotFoundException("HandTodo.ico")){
+   using var icon=new System.Drawing.Icon(stream);applicationIcon=(System.Drawing.Icon)icon.Clone();
+  }
   var hand=Resource("hand.png");handImage.Source=hand;canvas.Children.Add(handImage);canvas.Children.Add(inkImage);
   var normalized=Render(g=>g.DrawImage(hand,new Rect(0,0,W,H)));var pixels=Pixels(normalized);
   var map=Render(g=>g.DrawImage(Resource("hand-height.png"),new Rect(0,0,W,H)));var hp=Pixels(map);
@@ -70,9 +75,9 @@ public sealed class HandWindow:Window {
   var wrist=new TextBlock{Text="涂鸦",FontFamily=handwriting.FontFamily,FontSize=18,Foreground=Brushes.SaddleBrown,Width=52,Height=30,TextAlignment=TextAlignment.Center,Cursor=Cursors.Hand,RenderTransform=new RotateTransform(-5,26,15)};
   Canvas.SetLeft(wrist,26);Canvas.SetTop(wrist,296);canvas.Children.Add(wrist);wrist.MouseLeftButtonDown+=(s,e)=>e.Handled=true;wrist.MouseLeftButtonUp+=(s,e)=>{OpenTools(wrist);e.Handled=true;};
   canvas.MouseLeftButtonDown+=Press;canvas.MouseMove+=Drag;canvas.MouseLeftButtonUp+=Release;canvas.MouseRightButtonUp+=RightClick;canvas.MouseWheel+=Wheel;PreviewKeyDown+=Keys;
-  tray=new Forms.NotifyIcon{Icon=System.Drawing.SystemIcons.Application,Text="掌上待办",Visible=true};var tm=new Forms.ContextMenuStrip();tm.Opened+=(s,e)=>menuOpen=true;tm.Closed+=(s,e)=>menuOpen=false;
+  tray=new Forms.NotifyIcon{Icon=applicationIcon,Text="掌上待办",Visible=true};var tm=new Forms.ContextMenuStrip();tm.Opened+=(s,e)=>menuOpen=true;tm.Closed+=(s,e)=>menuOpen=false;
   tm.Items.Add("伸出手",null,(s,e)=>Reveal());tm.Items.Add("工具与洗手",null,(s,e)=>{Reveal();OpenTools(wrist);});tm.Items.Add("退出",null,(s,e)=>Close());tray.ContextMenuStrip=tm;tray.DoubleClick+=(s,e)=>Reveal();
-  timer=new DispatcherTimer{Interval=TimeSpan.FromMilliseconds(30)};timer.Tick+=(s,e)=>Tick();timer.Start();Loaded+=(s,e)=>{Refresh();Reveal();};Closed+=(s,e)=>{Commit();Save();timer.Stop();tray.Dispose();System.Windows.Application.Current.Shutdown();};
+  timer=new DispatcherTimer{Interval=TimeSpan.FromMilliseconds(30)};timer.Tick+=(s,e)=>Tick();timer.Start();Loaded+=(s,e)=>{Refresh();Reveal();};Closed+=(s,e)=>{Commit();Save();timer.Stop();tray.Dispose();applicationIcon.Dispose();System.Windows.Application.Current.Shutdown();};
  }
  string DataFile=>Path.Combine(folder,"state.json.gz");
  static BitmapSource Resource(string name){using var stream=Assembly.GetExecutingAssembly().GetManifestResourceStream(name)??throw new FileNotFoundException(name);var b=new BitmapImage();b.BeginInit();b.CacheOption=BitmapCacheOption.OnLoad;b.StreamSource=stream;b.EndInit();b.Freeze();return b;}
@@ -141,6 +146,7 @@ public sealed class HandWindow:Window {
  public void SelfTest(string output){
   static void Check(bool condition,string description){if(!condition)throw new InvalidOperationException(description);}
   Check(IsVisible&&canvas.Children.Count==3,"Native window and wrist tool must initialize");Check(assets.Count==5,"All five doodles must be embedded");Check(Skin(new Point(210,240)),"Palm must accept input");
+  Check(Icon is BitmapSource icon&&icon.PixelWidth==256&&tray.Icon==applicationIcon,"Application and tray must use the hi hand logo");
   foreach(var p in new[]{new Point(210,240),new Point(250,110),new Point(430,175)}){var q=Canonical(Display(p));Check(double.Hypot(p.X-q.X,p.Y-q.Y)<0.1,"Height-map coordinates must round trip");}
   BeginInput(new Point(210,240));Check(editor!=null,"Click input must create native editor");editor!.Text="下午交稿\n拿快递";Commit();Check(state.Notes.Count==1&&state.Notes[0].Height>30,"Multiline text must commit");
   var original=(byte[])state.Notes[0].Ink.Clone();Snapshot();Smudge(state.Notes[0],new Point(230,250),6,0);state.Notes[0].Done=true;Undo();Check(!state.Notes[0].Done&&original.SequenceEqual(state.Notes[0].Ink),"Undo must restore original ink and task state");

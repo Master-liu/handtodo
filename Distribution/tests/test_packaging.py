@@ -1,6 +1,8 @@
 import importlib.util
 import io
 import json
+import plistlib
+import struct
 from pathlib import Path
 import tempfile
 import unittest
@@ -12,6 +14,85 @@ pkg = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(pkg)
 
 class PackagingTests(unittest.TestCase):
+    def test_macos_icon_requires_bundle_configuration_and_exact_asset(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            app = root / "HandTodo.app"
+            resources = app / "Contents/Resources"
+            resources.mkdir(parents=True)
+            expected = root / "expected.icns"
+            expected.write_bytes(b"icns-confirmed-hi-logo")
+            info = app / "Contents/Info.plist"
+            info.write_bytes(plistlib.dumps({}))
+            (resources / "HandTodo.icns").write_bytes(expected.read_bytes())
+            with self.assertRaises(pkg.PackageError):
+                pkg.verify_macos_icon(app, expected)
+            info.write_bytes(plistlib.dumps({"CFBundleIconFile": "HandTodo"}))
+            self.assertEqual(pkg.verify_macos_icon(app, expected)["status"], "passed")
+            (resources / "HandTodo.icns").write_bytes(b"old icon")
+            with self.assertRaises(pkg.PackageError):
+                pkg.verify_macos_icon(app, expected)
+
+    @staticmethod
+    def icon_pe_fixture():
+        # A minimal PE32+ file with one native RT_ICON and RT_GROUP_ICON.
+        # The icon also occurs outside .rsrc, so matching arbitrary file bytes is insufficient.
+        payload = b"fixture image payload"
+        header = struct.pack("<HHH", 0, 1, 1)
+        entry = struct.pack("<BBBBHHI", 32, 32, 0, 0, 1, 32, len(payload))
+        ico = header + entry + struct.pack("<I", 22) + payload
+        group = header + entry + struct.pack("<H", 1)
+        data = bytearray(0x700)
+        data[:2] = b"MZ"
+        struct.pack_into("<I", data, 0x3c, 0x80)
+        data[0x80:0x84] = b"PE\0\0"
+        struct.pack_into("<H", data, 0x86, 1)
+        struct.pack_into("<H", data, 0x94, 0xf0)
+        struct.pack_into("<H", data, 0x98, 0x20b)
+        struct.pack_into("<II", data, 0x118, 0x1000, 0x400)
+        struct.pack_into("<IIII", data, 0x190, 0x400, 0x1000, 0x400, 0x200)
+        def directory(relative, entries):
+            start = 0x200+relative
+            struct.pack_into("<HH", data, start+12, 0, len(entries))
+            for i, (key, child) in enumerate(entries):
+                struct.pack_into("<II", data, start+16+8*i, key, child)
+        directory(0, [(3, 0x80000020), (14, 0x80000038)])
+        directory(32, [(1, 0x80000050)])
+        directory(56, [(32512, 0x80000068)])
+        directory(80, [(0, 128)])
+        directory(104, [(0, 144)])
+        struct.pack_into("<IIII", data, 0x280, 0x10a0, len(payload), 0, 0)
+        struct.pack_into("<IIII", data, 0x290, 0x1100, len(group), 0, 0)
+        data[0x2a0:0x2a0+len(payload)] = payload
+        data[0x300:0x300+len(group)] = group
+        data[0x600:0x600+len(ico)] = ico
+        return data, ico
+
+    def test_windows_icon_checks_native_resource_payload(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            data, ico = self.icon_pe_fixture()
+            exe, icon = root / "HandTodo.exe", root / "HandTodo.ico"
+            exe.write_bytes(data)
+            icon.write_bytes(ico)
+            self.assertEqual(pkg.verify_windows_icon(exe, icon)["sizes"], [32])
+            data[0x2a0] ^= 1
+            exe.write_bytes(data)
+            with self.assertRaises(pkg.PackageError):
+                pkg.verify_windows_icon(exe, icon)
+
+    def test_windows_icon_rejects_asset_without_native_icon_registration(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            data, ico = self.icon_pe_fixture()
+            # Only register a different resource type. The complete ICO remains in the file.
+            struct.pack_into("<I", data, 0x210, 10)
+            exe, icon = root / "HandTodo.exe", root / "HandTodo.ico"
+            exe.write_bytes(data)
+            icon.write_bytes(ico)
+            with self.assertRaises(pkg.PackageError):
+                pkg.verify_windows_icon(exe, icon)
+
     def test_finder_metadata_does_not_change_source_fingerprint(self):
         with tempfile.TemporaryDirectory() as d, patch.object(pkg, "ROOT", Path(d)):
             root = Path(d)

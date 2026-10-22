@@ -83,12 +83,14 @@
 
 ## 分发给朋友
 
-- **macOS**：运行 `Distribution/package-macos.sh`，输出 Apple 芯片与 Intel 通用 DMG（macOS 13+）。
+- **macOS**：运行 `Distribution/package-macos.sh`，输出仅支持 Apple 芯片的 arm64 DMG（macOS 13+）。
 - **Windows**：运行 `Distribution/package-windows.sh`，输出 Windows 10/11 x64 便携 ZIP，包含独立运行的 `HandTodo.exe` 和中文说明，不需要另装 .NET。
 
 Windows 为原生 WPF/.NET 8 适配版，源代码在 `Windows/`；构建需要 .NET 8 SDK，macOS 可交叉编译。GitHub Actions 会在 Windows 上构建、运行原生启动与核心功能检查，并保留测试截图和独立程序产物。两个平台分别在本机存储内容，不自动同步。
 
 当前为未签名的朋友试用版，未提供 Apple 公证和 Windows 代码签名；系统首次运行可能显示来源提示。安装包不包含开发机上的个人待办、涂画或恢复备份。分发产物位于 `Distribution/output/`，不提交到 Git。
+
+应用图标使用已确认的「hi」手掌 Logo。Mac 在应用包中配置 ICNS 图标；Windows 将 ICO 嵌入程序，同时用于托盘图标，并为原生窗口提供对应 PNG。
 
 ## 统一打包工具
 
